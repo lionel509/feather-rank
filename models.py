@@ -1,3 +1,11 @@
+
+@dataclass
+class Signature:
+    match_id: int
+    user_id: int
+    decision: str
+    signed_name: str | None
+    signed_at: str
 """
 Data models for the badminton ranking system.
 """
