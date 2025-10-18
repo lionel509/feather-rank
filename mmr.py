@@ -102,3 +102,22 @@ def apply_team_match(
     new_rB = [r - delta for r in rB]
     
     return (new_rA, new_rB)
+
+def expected_points_share(ra: float, rb: float) -> float:
+    """Expected share of points for A vs B (Elo formula)."""
+    return 1 / (1 + 10 ** (-(ra - rb) / 400))
+
+def elo_points_update(ra: float, rb: float, share_a: float, k: int = 32) -> tuple[float, float]:
+    """Update ratings based on points share for A (fraction of total points won)."""
+    Ea = expected_points_share(ra, rb)
+    delta = k * (share_a - Ea)
+    return ra + delta, rb - delta
+
+def team_points_update(ratingsA: list[float], ratingsB: list[float], share_a: float, k: int = 32) -> tuple[list[float], list[float]]:
+    """Update team ratings based on points share for team A."""
+    Ra = sum(ratingsA) / len(ratingsA)
+    Rb = sum(ratingsB) / len(ratingsB)
+    newA, newB = elo_points_update(Ra, Rb, share_a, k)
+    dA = newA - Ra
+    dB = newB - Rb
+    return [r + dA for r in ratingsA], [r + dB for r in ratingsB]

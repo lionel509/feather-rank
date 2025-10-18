@@ -1,3 +1,68 @@
+# --- Points and Set Scores Helpers ---
+import json
+from logging_config import get_logger
+log = get_logger(__name__)
+
+async def insert_pending_match_points(
+    guild_id: int,
+    mode: str,
+    team_a: list[int],
+    team_b: list[int],
+    set_scores: list[dict],
+    reporter: int
+) -> int:
+    """Insert a pending match with set_scores and points columns, return its ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        now = datetime.utcnow().isoformat()
+        team_a_str = ",".join(map(str, team_a))
+        team_b_str = ",".join(map(str, team_b))
+        set_scores_str = json.dumps(set_scores)
+        cursor = await db.execute(
+            """
+            INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0)
+            """,
+            (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter)
+        )
+        await db.commit()
+    match_id = cursor.lastrowid if cursor.lastrowid is not None else -1
+    log.debug("Inserted pending points match id=%s guild=%s mode=%s A=%s B=%s", match_id, guild_id, mode, team_a_str, team_b_str)
+    return match_id
+
+async def finalize_points(
+    match_id: int,
+    winner: str,
+    set_scores: list[dict],
+    points_a: int,
+    points_b: int
+) -> None:
+    """Finalize a match: set winner, set_scores, points_a, points_b."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        set_scores_str = json.dumps(set_scores)
+        await db.execute(
+            """
+            UPDATE matches
+            SET winner = ?, set_scores = ?, points_a = ?, points_b = ?, status = 'verified'
+            WHERE id = ?
+            """,
+            (winner, set_scores_str, points_a, points_b, match_id)
+        )
+        await db.commit()
+    log.debug("Finalized match id=%s winner=%s points A=%s B=%s", match_id, winner, points_a, points_b)
+
+async def get_set_scores(match_id: int) -> list[dict]:
+    """Get set_scores (as list of dict) for a match."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT set_scores FROM matches WHERE id = ?", (match_id,)) as cursor:
+            row = await cursor.fetchone()
+            if row and row[0]:
+                try:
+                    scores = json.loads(row[0])
+                    log.debug("Fetched set_scores for match id=%s -> %s", match_id, scores)
+                    return scores
+                except Exception:
+                    return []
+            return []
 # --- Pending Match and Signature/ToS Helpers ---
 from typing import Any
 
@@ -24,7 +89,9 @@ async def insert_pending_match(
             (guild_id, mode, team_a_str, team_b_str, set_winners_str, winner, now, reporter, reporter)
         )
         await db.commit()
-        return cursor.lastrowid if cursor.lastrowid is not None else -1
+    match_id = cursor.lastrowid if cursor.lastrowid is not None else -1
+    log.debug("Inserted pending match id=%s guild=%s mode=%s A=%s B=%s winner=%s", match_id, guild_id, mode, team_a_str, team_b_str, winner)
+    return match_id
 
 async def add_signature(match_id: int, user_id: int, decision: str, signed_name: str | None) -> None:
     """Add or update a match signature."""
@@ -38,6 +105,7 @@ async def add_signature(match_id: int, user_id: int, decision: str, signed_name:
             (match_id, user_id, decision, signed_name or "", now)
         )
         await db.commit()
+    log.debug("Signature recorded match=%s user=%s decision=%s name=%s", match_id, user_id, decision, signed_name)
 
 async def get_match(match_id: int) -> Any:
     """Get a match row by ID."""
@@ -45,7 +113,9 @@ async def get_match(match_id: int) -> Any:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM matches WHERE id = ?", (match_id,)) as cursor:
             row = await cursor.fetchone()
-            return dict(row) if row else None
+            data = dict(row) if row else None
+            log.debug("Fetched match id=%s -> found=%s", match_id, bool(data))
+            return data
 
 async def get_match_participant_ids(match_id: int) -> list[int]:
     """Get all participant user IDs for a match."""
@@ -63,13 +133,16 @@ async def get_signatures(match_id: int) -> list[dict]:
         db.row_factory = aiosqlite.Row
         async with db.execute("SELECT * FROM match_signatures WHERE match_id = ?", (match_id,)) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            out = [dict(row) for row in rows]
+            log.debug("Fetched %s signatures for match=%s", len(out), match_id)
+            return out
 
 async def set_match_status(match_id: int, status: str) -> None:
     """Set the status of a match."""
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute("UPDATE matches SET status = ? WHERE id = ?", (status, match_id))
         await db.commit()
+    log.debug("Set match status id=%s status=%s", match_id, status)
 
 async def list_pending_for_user(user_id: int, guild_id: int) -> list[dict]:
     """List all pending matches for a user in a guild."""
@@ -91,14 +164,18 @@ async def list_pending_for_user(user_id: int, guild_id: int) -> list[dict]:
             )
         ) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            out = [dict(row) for row in rows]
+            log.debug("Pending matches for user=%s guild=%s -> %s", user_id, guild_id, len(out))
+            return out
 
 async def has_accepted_tos(user_id: int) -> bool:
     """Check if a user has accepted the ToS."""
     async with aiosqlite.connect(DB_PATH) as db:
         async with db.execute("SELECT 1 FROM tos_acceptances WHERE user_id = ?", (user_id,)) as cursor:
             row = await cursor.fetchone()
-            return bool(row)
+            accepted = bool(row)
+            log.debug("has_accepted_tos user=%s -> %s", user_id, accepted)
+            return accepted
 
 async def set_tos_accepted(user_id: int, version: str = "v1") -> None:
     """Set ToS acceptance for a user."""
@@ -109,18 +186,29 @@ async def set_tos_accepted(user_id: int, version: str = "v1") -> None:
             (user_id, now, version)
         )
         await db.commit()
+    log.debug("set_tos_accepted user=%s version=%s", user_id, version)
+
 import aiosqlite
 from datetime import datetime
 from typing import Optional
+
+# Helper to check if a table has a column
+async def table_has_column(table: str, column: str, db_path: str = "feather_rank.db") -> bool:
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(f"PRAGMA table_info({table})") as cursor:
+            async for row in cursor:
+                if row[1] == column:
+                    return True
+    return False
 
 # Global variable for database path (will be set by init_db)
 DB_PATH = "feather_rank.db"
 
 async def init_db(db_path: str = "feather_rank.db"):
-    """Initialize the database with required tables."""
+    """Initialize the database with required tables and columns."""
     global DB_PATH
     DB_PATH = db_path
-    
+
     async with aiosqlite.connect(DB_PATH) as db:
         # Create players table
         await db.execute("""
@@ -135,7 +223,7 @@ async def init_db(db_path: str = "feather_rank.db"):
             )
         """)
 
-        # Create or alter matches table to include new columns
+        # Create matches table (old columns for backward compatibility)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS matches (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -152,7 +240,18 @@ async def init_db(db_path: str = "feather_rank.db"):
             )
         """)
 
-        # Try to add new columns if the table already exists (for upgrades)
+        # Add new columns to matches if missing
+        # set_scores TEXT
+        if not await table_has_column("matches", "set_scores", DB_PATH):
+            await db.execute("ALTER TABLE matches ADD COLUMN set_scores TEXT")
+        # points_a INT DEFAULT 0
+        if not await table_has_column("matches", "points_a", DB_PATH):
+            await db.execute("ALTER TABLE matches ADD COLUMN points_a INTEGER NOT NULL DEFAULT 0")
+        # points_b INT DEFAULT 0
+        if not await table_has_column("matches", "points_b", DB_PATH):
+            await db.execute("ALTER TABLE matches ADD COLUMN points_b INTEGER NOT NULL DEFAULT 0")
+
+        # Try to add status and reporter columns for upgrades (legacy)
         try:
             await db.execute("ALTER TABLE matches ADD COLUMN status TEXT CHECK(status IN ('pending','verified','rejected')) NOT NULL DEFAULT 'pending'")
         except Exception:
@@ -184,34 +283,39 @@ async def init_db(db_path: str = "feather_rank.db"):
         """)
 
         await db.commit()
+    log.debug("Initialized database at %s", DB_PATH)
 
 async def get_or_create_player(user_id: int, username: str, base_rating: float = 1200) -> dict:
     """Get existing player or create new one."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
-        
         # Try to get existing player
         async with db.execute(
             "SELECT * FROM players WHERE user_id = ?", (user_id,)
         ) as cursor:
             row = await cursor.fetchone()
             if row:
-                return dict(row)
-        
+                player = dict(row)
+                log.debug("Fetched existing player user_id=%s rating=%.2f", user_id, player.get("rating", 0))
+                return player
         # Create new player
         now = datetime.utcnow().isoformat()
-        await db.execute("""
+        await db.execute(
+            """
             INSERT INTO players (user_id, username, rating, wins, losses, created_at, updated_at)
             VALUES (?, ?, ?, 0, 0, ?, ?)
-        """, (user_id, username, base_rating, now, now))
+            """,
+            (user_id, username, base_rating, now, now),
+        )
         await db.commit()
-        
         # Return the newly created player
         async with db.execute(
             "SELECT * FROM players WHERE user_id = ?", (user_id,)
         ) as cursor:
             row = await cursor.fetchone()
-            return dict(row)
+            player = dict(row) if row else {}
+            log.debug("Created new player user_id=%s rating=%.2f", user_id, player.get("rating", 0))
+            return player
 
 async def update_player(user_id: int, new_rating: float, won: bool):
     """Update player rating and win/loss count."""
@@ -232,6 +336,7 @@ async def update_player(user_id: int, new_rating: float, won: bool):
             """, (new_rating, now, user_id))
         
         await db.commit()
+    log.debug("Updated player user_id=%s rating=%.2f won=%s", user_id, new_rating, won)
 
 async def insert_match(
     guild_id: int,
@@ -245,19 +350,21 @@ async def insert_match(
     """Insert a new match record and return its ID."""
     async with aiosqlite.connect(DB_PATH) as db:
         now = datetime.utcnow().isoformat()
-        
         # Convert lists to comma-separated strings
         team_a_str = ",".join(map(str, team_a))
         team_b_str = ",".join(map(str, team_b))
         set_winners_str = ",".join(set_winners)
-        
-        cursor = await db.execute("""
+        cursor = await db.execute(
+            """
             INSERT INTO matches (guild_id, mode, team_a, team_b, set_winners, winner, created_by, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (guild_id, mode, team_a_str, team_b_str, set_winners_str, winner, created_by, now))
-        
+            """,
+            (guild_id, mode, team_a_str, team_b_str, set_winners_str, winner, created_by, now),
+        )
         await db.commit()
-        return cursor.lastrowid
+        new_id = cursor.lastrowid if cursor.lastrowid is not None else -1
+    log.debug("Inserted match id=%s guild=%s mode=%s", new_id, guild_id, mode)
+    return new_id
 
 async def top_players(guild_id: int, limit: int = 10) -> list[dict]:
     """Get top players by rating."""
@@ -270,7 +377,9 @@ async def top_players(guild_id: int, limit: int = 10) -> list[dict]:
             LIMIT ?
         """, (limit,)) as cursor:
             rows = await cursor.fetchall()
-            return [dict(row) for row in rows]
+            out = [dict(row) for row in rows]
+            log.debug("Top players query limit=%s -> %s", limit, len(out))
+            return out
 
 async def recent_matches(guild_id: int, user_id: Optional[int] = None, limit: int = 10) -> list[dict]:
     """Get recent matches, optionally filtered by user_id."""
@@ -279,7 +388,8 @@ async def recent_matches(guild_id: int, user_id: Optional[int] = None, limit: in
         
         if user_id is not None:
             # Filter matches where user_id appears in either team
-            async with db.execute("""
+            async with db.execute(
+                """
                 SELECT * FROM matches
                 WHERE guild_id = ? AND (
                     team_a LIKE ? OR 
@@ -291,21 +401,32 @@ async def recent_matches(guild_id: int, user_id: Optional[int] = None, limit: in
                 )
                 ORDER BY created_at DESC
                 LIMIT ?
-            """, (
-                guild_id,
-                f"{user_id},%", f"%,{user_id},%", f"%,{user_id}",
-                f"{user_id},%", f"%,{user_id},%", f"%,{user_id}",
-                limit
-            )) as cursor:
+                """,
+                (
+                    guild_id,
+                    f"{user_id},%",
+                    f"%,{user_id},%",
+                    f"%,{user_id}",
+                    f"{user_id},%",
+                    f"%,{user_id},%",
+                    f"%,{user_id}",
+                    limit,
+                ),
+            ) as cursor:
                 rows = await cursor.fetchall()
         else:
             # Get all recent matches for the guild
-            async with db.execute("""
+            async with db.execute(
+                """
                 SELECT * FROM matches
                 WHERE guild_id = ?
                 ORDER BY created_at DESC
                 LIMIT ?
-            """, (guild_id, limit)) as cursor:
+                """,
+                (guild_id, limit),
+            ) as cursor:
                 rows = await cursor.fetchall()
-        
-        return [dict(row) for row in rows]
+
+        out = [dict(row) for row in rows]
+        log.debug("Recent matches guild=%s user=%s limit=%s -> %s", guild_id, user_id, limit, len(out))
+        return out

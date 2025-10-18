@@ -199,6 +199,33 @@ def test_config():
     return True
 
 
+async def test_tos():
+    print("🧪 Testing ToS acceptance...")
+    import db
+    test_db_path = "test_feather_rank.db"
+    await db.init_db(test_db_path)
+    user_id = 55555
+    # Should not have accepted yet
+    accepted = await db.has_accepted_tos(user_id)
+    assert not accepted, "User should not have accepted ToS yet"
+    print("  ✓ ToS not accepted by default")
+    # Accept ToS
+    await db.set_tos_accepted(user_id, version="testv1")
+    accepted = await db.has_accepted_tos(user_id)
+    assert accepted, "User should have accepted ToS after set_tos_accepted"
+    print("  ✓ ToS accepted and stored")
+    # Accept again (should not error)
+    await db.set_tos_accepted(user_id, version="testv2")
+    accepted = await db.has_accepted_tos(user_id)
+    assert accepted, "User should still have accepted ToS after re-accepting"
+    print("  ✓ ToS re-acceptance does not break")
+    print("✅ ToS tests passed!\n")
+    # Cleanup
+    if os.path.exists(test_db_path):
+        os.remove(test_db_path)
+        print("  🧹 Cleaned up test database")
+
+
 async def run_all_tests():
     """Run all tests"""
     print("=" * 60)
@@ -234,6 +261,14 @@ async def run_all_tests():
     except Exception as e:
         print(f"❌ Config test failed: {e}\n")
         results.append(("Config", False))
+    
+    # Test 5: ToS
+    try:
+        await test_tos()
+        results.append(("ToS", True))
+    except Exception as e:
+        print(f"❌ ToS test failed: {e}\n")
+        results.append(("ToS", False))
     
     # Summary
     print("=" * 60)

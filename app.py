@@ -1,3 +1,5 @@
+from rules import valid_set, match_winner
+from db import insert_pending_match_points
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -5,6 +7,7 @@ import os
 import asyncio
 import aiosqlite
 from collections import defaultdict
+from logging_config import setup_logging, get_logger
 from db import (
     init_db, get_or_create_player, update_player, insert_match, top_players, recent_matches, DB_PATH,
     has_accepted_tos, set_tos_accepted, get_match, get_match_participant_ids, get_signatures, set_match_status, add_signature,
@@ -12,13 +15,19 @@ from db import (
 )
 from mmr import apply_team_match
 
-# Load environment variables
+# Load environment variables and setup logging early
 load_dotenv()
+setup_logging()  # respects LOG_LEVEL env var; default INFO
+log = get_logger(__name__)
 TOKEN = os.getenv('DISCORD_TOKEN')
 
 # Configuration
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "./smashcord.sqlite")
+# Point-based match rules
+POINTS_TARGET = int(os.getenv("POINTS_TARGET", "21"))
+POINTS_WIN_BY = int(os.getenv("POINTS_WIN_BY", "2"))
+POINTS_CAP = int(os.getenv("POINTS_CAP", "30"))
 
 # Guild-based locks for database writes
 guild_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -51,8 +60,8 @@ async def on_ready():
     await tree.sync()
     # Set bot status to "Playing Badminton"
     await bot.change_presence(activity=discord.Game(name="Badminton 🏸"))
-    print(f'Logged in as {bot.user}')
-    print(f'Status: Playing Badminton 🏸')
+    log.info(f"Bot ready as %s (guilds=%s)", bot.user, len(bot.guilds))
+    log.debug("Commands synced and presence set")
 
 @tree.command(name="ping", description="Replies with pong")
 async def ping(interaction: discord.Interaction):
@@ -75,6 +84,7 @@ async def agree_tos(interaction: discord.Interaction):
         f"{TOS_TEXT}\n\n✅ You have agreed to the Terms of Service. You may now use all features.",
         ephemeral=True
     )
+    log.info("User %s accepted ToS", interaction.user.id)
 
 @tree.command(name="match_doubles", description="Record a 2v2 badminton match")
 @app_commands.describe(
@@ -134,8 +144,128 @@ async def match_doubles(
             winner=winner,
             reporter=interaction.user.id
         )
+    log.info("Created pending match #%s (2v2) guild=%s reporter=%s", match_id, guild_id, interaction.user.id)
     await notify_verification(match_id)
     await interaction.followup.send(f"Match #{match_id} created. Waiting for approvals.", ephemeral=True)
+
+# --- Doubles match with points ---
+@tree.command(name="match_doubles_points", description="Record a 2v2 badminton match (point-based)")
+@app_commands.describe(
+    a1="Team A - Player 1",
+    a2="Team A - Player 2",
+    b1="Team B - Player 1",
+    b2="Team B - Player 2",
+    s1a="Set 1: points for A",
+    s1b="Set 1: points for B",
+    s2a="Set 2: points for A",
+    s2b="Set 2: points for B",
+    s3a="Set 3: points for A (optional)",
+    s3b="Set 3: points for B (optional)"
+)
+async def match_doubles_points(
+    interaction: discord.Interaction,
+    a1: discord.User,
+    a2: discord.User,
+    b1: discord.User,
+    b2: discord.User,
+    s1a: int,
+    s1b: int,
+    s2a: int,
+    s2b: int,
+    s3a: int | None = None,
+    s3b: int | None = None
+):
+    if not await require_tos(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    all_players = [a1.id, a2.id, b1.id, b2.id]
+    if len(set(all_players)) != 4:
+        await interaction.followup.send("❌ All four players must be different.", ephemeral=True)
+        return
+    set_scores = [
+        {"A": s1a, "B": s1b},
+        {"A": s2a, "B": s2b}
+    ]
+    if s3a is not None and s3b is not None:
+        set_scores.append({"A": s3a, "B": s3b})
+    # Validate each set
+    for i, s in enumerate(set_scores):
+        if not valid_set(s["A"], s["B"], POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP):
+            await interaction.followup.send(f"❌ Set {i+1} is not valid.", ephemeral=True)
+            return
+    winner, sets_a, sets_b, points_a, points_b = match_winner(set_scores, POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP)
+    if not winner:
+        await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
+        return
+    guild_id = interaction.guild_id or 0
+    async with get_guild_lock(guild_id):
+        match_id = await insert_pending_match_points(
+            guild_id=guild_id,
+            mode="2v2",
+            team_a=[a1.id, a2.id],
+            team_b=[b1.id, b2.id],
+            set_scores=set_scores,
+            reporter=interaction.user.id
+        )
+    await notify_verification(match_id)
+    await interaction.followup.send(f"Match #{match_id} pending verification.", ephemeral=True)
+
+# --- Singles match with points ---
+@tree.command(name="match_singles", description="Record a 1v1 badminton match (point-based)")
+@app_commands.describe(
+    a="Player A",
+    b="Player B",
+    s1a="Set 1: points for A",
+    s1b="Set 1: points for B",
+    s2a="Set 2: points for A",
+    s2b="Set 2: points for B",
+    s3a="Set 3: points for A (optional)",
+    s3b="Set 3: points for B (optional)"
+)
+async def match_singles(
+    interaction: discord.Interaction,
+    a: discord.User,
+    b: discord.User,
+    s1a: int,
+    s1b: int,
+    s2a: int,
+    s2b: int,
+    s3a: int | None = None,
+    s3b: int | None = None
+):
+    if not await require_tos(interaction):
+        return
+    await interaction.response.defer(ephemeral=True)
+    if a.id == b.id:
+        await interaction.followup.send("❌ Players must be different.", ephemeral=True)
+        return
+    set_scores = [
+        {"A": s1a, "B": s1b},
+        {"A": s2a, "B": s2b}
+    ]
+    if s3a is not None and s3b is not None:
+        set_scores.append({"A": s3a, "B": s3b})
+    # Validate each set
+    for i, s in enumerate(set_scores):
+        if not valid_set(s["A"], s["B"], POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP):
+            await interaction.followup.send(f"❌ Set {i+1} is not valid.", ephemeral=True)
+            return
+    winner, sets_a, sets_b, points_a, points_b = match_winner(set_scores, POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP)
+    if not winner:
+        await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
+        return
+    guild_id = interaction.guild_id or 0
+    async with get_guild_lock(guild_id):
+        match_id = await insert_pending_match_points(
+            guild_id=guild_id,
+            mode="1v1",
+            team_a=[a.id],
+            team_b=[b.id],
+            set_scores=set_scores,
+            reporter=interaction.user.id
+        )
+    await notify_verification(match_id)
+    await interaction.followup.send(f"Match #{match_id} pending verification.", ephemeral=True)
 
 @tree.command(name="leaderboard", description="Show the top players by rating")
 @app_commands.describe(limit="Number of players to show (default: 20)")
@@ -183,6 +313,7 @@ async def leaderboard(interaction: discord.Interaction, limit: int = 20):
         return
     
     await interaction.followup.send(f"## 🏆 Leaderboard (Top {len(players)})\n{leaderboard_text}")
+    log.debug("Sent leaderboard for guild=%s, limit=%s", interaction.guild_id, limit)
 
 @tree.command(name="stats", description="Show player statistics")
 @app_commands.describe(user="The user to show stats for")
@@ -244,6 +375,7 @@ async def stats(interaction: discord.Interaction, user: discord.User):
         stats_msg += "\n*No recent matches found.*"
     
     await interaction.followup.send(stats_msg)
+    log.debug("Sent stats for user=%s guild=%s", user.id, interaction.guild_id)
 
 @tree.command(name="verify", description="Verify a match result")
 @app_commands.describe(
@@ -267,13 +399,16 @@ async def verify(
     match = await get_match(match_id)
     if not match:
         await interaction.followup.send(f"❌ Match ID {match_id} not found.")
+        log.warning("Verify failed: match not found id=%s user=%s", match_id, interaction.user.id)
         return
     participants = await get_match_participant_ids(match_id)
     if interaction.user.id not in participants:
         await interaction.followup.send("❌ You are not a participant in this match.")
+        log.warning("Verify blocked: non-participant user=%s match=%s", interaction.user.id, match_id)
         return
     if interaction.user.id == match.get("reporter"):
         await interaction.followup.send("❌ The reporter cannot verify their own match.")
+        log.warning("Verify blocked: reporter self-verify user=%s match=%s", interaction.user.id, match_id)
         return
     # Insert or update signature
     await add_signature(match_id, interaction.user.id, decision.value, name)
@@ -282,6 +417,7 @@ async def verify(
     # If any reject, set status and notify reporter
     if any(sig["decision"] == "reject" for sig in signatures):
         await set_match_status(match_id, "rejected")
+        log.info("Match #%s rejected by user=%s", match_id, interaction.user.id)
         # Try to notify reporter
         reporter_id = match.get("reporter")
         if reporter_id:
@@ -296,6 +432,7 @@ async def verify(
     non_reporters = [pid for pid in participants if pid != match.get("reporter")]
     if all(any(sig["user_id"] == pid and sig["decision"] == "approve" for sig in signatures) for pid in non_reporters):
         await finalize_match(match_id)
+        log.info("Match #%s finalized (all signatures collected)", match_id)
         await interaction.followup.send("✅ All participants approved. Match finalized.")
         return
     # Otherwise, show current signature state
@@ -304,6 +441,7 @@ async def verify(
         for sig in signatures
     ])
     await interaction.followup.send(f"📝 Signature state for match {match_id}:\n```\n{sig_table}\n```")
+    log.debug("Signature state requested for match=%s", match_id)
 
 @tree.command(name="pending", description="List your matches awaiting your verification")
 async def pending(interaction: discord.Interaction):
@@ -315,6 +453,7 @@ async def pending(interaction: discord.Interaction):
     matches = await list_pending_for_user(user_id, guild_id)
     if not matches:
         await interaction.followup.send("You have no pending matches to verify!", ephemeral=True)
+        log.debug("No pending matches for user=%s guild=%s", user_id, guild_id)
         return
     lines = []
     for match in matches:
@@ -333,45 +472,72 @@ async def pending(interaction: discord.Interaction):
         await interaction.followup.send("You have no pending matches to verify!", ephemeral=True)
         return
     await interaction.followup.send("\n\n".join(lines), ephemeral=True)
+    log.debug("Listed %s pending matches for user=%s guild=%s", len(lines), user_id, guild_id)
 
 # --- Finalize match stub ---
 async def finalize_match(match_id: int):
+    import json
+    from rules import match_winner
+    from mmr import team_points_update
     match = await get_match(match_id)
     if not match:
+        log.error("Finalize failed: match not found id=%s", match_id)
         return
-    # Parse teams
     team_a_ids = [int(x) for x in match['team_a'].split(',') if x]
     team_b_ids = [int(x) for x in match['team_b'].split(',') if x]
     mode = match.get('mode')
-    winner = match.get('winner')
+    # Load set_scores
+    try:
+        set_scores = json.loads(match.get('set_scores') or '[]')
+    except Exception:
+        set_scores = []
+        log.exception("Failed to parse set_scores for match=%s", match_id)
+    # Compute winner, points
+    winner, _, _, points_a, points_b = match_winner(
+        set_scores,
+        POINTS_TARGET,
+        POINTS_WIN_BY,
+        POINTS_CAP
+    )
+    share_a = points_a / max(1, (points_a + points_b))
     # Get player info
     players_a = [await get_or_create_player(uid, f"User{uid}") for uid in team_a_ids]
     players_b = [await get_or_create_player(uid, f"User{uid}") for uid in team_b_ids]
     ratings_a = [p['rating'] for p in players_a]
     ratings_b = [p['rating'] for p in players_b]
-    # Apply Elo
-    new_ratings_a, new_ratings_b = apply_team_match(ratings_a, ratings_b, winner, k=K_FACTOR)
-    # Update players
+    # Update ratings using points share
+    new_ratings_a, new_ratings_b = team_points_update(ratings_a, ratings_b, share_a, k=K_FACTOR)
+    # Update players' ratings and W/L
     for i, p in enumerate(players_a):
         await update_player(p['user_id'], new_ratings_a[i], won=(winner == 'A'))
     for i, p in enumerate(players_b):
         await update_player(p['user_id'], new_ratings_b[i], won=(winner == 'B'))
-    # Set match status
-    await set_match_status(match_id, 'verified')
-    # Build summary
+    # Finalize match in DB
+    from db import finalize_points
+    await finalize_points(match_id, winner, set_scores, points_a, points_b)
+    log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, points_a, points_b)
+    # Build summary with per-set scores
     summary = f"🏸 Match Verified!\nMatch ID: {match_id}\nMode: {mode}\nWinner: Team {winner}\n"
     summary += f"Team A: {', '.join(str(uid) for uid in team_a_ids)}\n"
     summary += f"Team B: {', '.join(str(uid) for uid in team_b_ids)}\n"
+    summary += "Set Scores:\n"
+    for idx, s in enumerate(set_scores, 1):
+        summary += f"  Set {idx}: A {s.get('A', 0)} - B {s.get('B', 0)}\n"
+    summary += f"Total Points: A {points_a} - B {points_b}\n"
     # Try to post in channel (if available)
     channel_id = match.get('channel_id')
     sent = False
     if channel_id:
         try:
             channel = await bot.fetch_channel(channel_id)
-            await channel.send(summary)
+            # Only send to channels that support .send (TextChannel, Thread)
+            if isinstance(channel, (discord.TextChannel, discord.Thread)):
+                await channel.send(summary)
+            else:
+                raise TypeError(f"Unsupported channel type: {type(channel)}")
             sent = True
         except Exception:
-            pass
+            log.warning("Failed to post summary to channel_id=%s for match=%s", channel_id, match_id, exc_info=True)
     # Fallback: DM reporter
     if not sent:
         reporter_id = match.get('reporter')
@@ -380,11 +546,12 @@ async def finalize_match(match_id: int):
                 user = await bot.fetch_user(reporter_id)
                 await user.send(summary)
             except Exception:
-                pass
+                log.warning("Failed to DM reporter=%s for match=%s", reporter_id, match_id, exc_info=True)
 
 async def notify_verification(match_id: int):
     match = await get_match(match_id)
     if not match:
+        log.error("Notify failed: match not found id=%s", match_id)
         return
     participants = await get_match_participant_ids(match_id)
     reporter = match.get("reporter")
@@ -400,8 +567,12 @@ async def notify_verification(match_id: int):
             user = await bot.fetch_user(user_id)
             await user.send(summary)
         except Exception:
-            pass
+            log.warning("Failed to DM user=%s for verification of match=%s", user_id, match_id, exc_info=True)
 
 # Run the bot
 if __name__ == "__main__":
+    if not TOKEN:
+        log.error("DISCORD_TOKEN not set. Please provide it via environment or .env file.")
+        raise SystemExit(1)
+    log.info("Starting bot…")
     bot.run(TOKEN)

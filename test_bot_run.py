@@ -7,13 +7,16 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 import os
+from logging_config import setup_logging, get_logger
 
-# Load environment variables
+# Load environment variables and setup logging
 load_dotenv()
+setup_logging()  # use LOG_LEVEL=DEBUG for very verbose logs
+log = get_logger(__name__)
 TOKEN = os.getenv('DISCORD_TOKEN')
 
 if not TOKEN:
-    print("❌ ERROR: DISCORD_TOKEN not found in .env file!")
+    log.error("DISCORD_TOKEN not found in .env file!")
     print("Please create a .env file with your Discord bot token:")
     print("DISCORD_TOKEN=your_token_here")
     exit(1)
@@ -32,11 +35,9 @@ async def on_ready():
     await tree.sync()
     # Set status
     await bot.change_presence(activity=discord.Game(name="Badminton 🏸 [TEST MODE]"))
-    print("=" * 60)
-    print(f"✅ Bot logged in as: {bot.user}")
-    print(f"🆔 Bot ID: {bot.user.id}")
-    print(f"🏸 Status: Playing Badminton 🏸 [TEST MODE]")
-    print(f"🌐 Connected to {len(bot.guilds)} server(s)")
+    bu = bot.user
+    bu_id = getattr(bu, "id", "?")
+    log.info("Bot logged in as %s (id=%s) guilds=%s [TEST MODE]", bu, bu_id, len(bot.guilds))
     print("=" * 60)
     print("\n📋 Available test commands:")
     print("  /ping - Simple ping test")
@@ -100,17 +101,15 @@ async def test_defer(interaction: discord.Interaction):
 
 @bot.event
 async def on_guild_join(guild):
-    print(f"🎉 Bot joined new server: {guild.name} (ID: {guild.id})")
+    log.info("Joined new server: %s (ID: %s)", guild.name, guild.id)
 
 @bot.event
 async def on_guild_remove(guild):
-    print(f"👋 Bot left server: {guild.name} (ID: {guild.id})")
+    log.info("Left server: %s (ID: %s)", guild.name, guild.id)
 
 @bot.event
 async def on_error(event, *args, **kwargs):
-    print(f"❌ Error in {event}")
-    import traceback
-    traceback.print_exc()
+    log.exception("Error in %s", event)
 
 # Run the bot
 if __name__ == "__main__":
@@ -121,9 +120,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n👋 Bot stopped by user")
     except discord.LoginFailure:
-        print("\n❌ ERROR: Invalid Discord token!")
+        log.error("Invalid Discord token!")
         print("Please check your DISCORD_TOKEN in the .env file")
     except Exception as e:
-        print(f"\n❌ ERROR: {e}")
-        import traceback
-        traceback.print_exc()
+        log.exception("Unhandled error: %s", e)
