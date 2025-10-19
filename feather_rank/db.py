@@ -397,11 +397,18 @@ async def init_db(db_path: str = "feather_rank.db"):
             """
             CREATE TABLE IF NOT EXISTS verification_messages(
               message_id INTEGER PRIMARY KEY,
-              match_id INTEGER NOT NULL,
-              guild_id INTEGER,
-              user_id INTEGER NOT NULL,
-              created_at TEXT
+              match_id   INTEGER NOT NULL,
+              guild_id   INTEGER,
+              user_id    INTEGER NOT NULL,
+              created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
             )
+            """
+        )
+
+        # Index for faster lookups by match_id
+        await db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_verif_match ON verification_messages(match_id)
             """
         )
 
@@ -411,15 +418,44 @@ async def init_db(db_path: str = "feather_rank.db"):
 async def record_verification_message(message_id: int, match_id: int, guild_id: int | None, user_id: int) -> None:
     """Record a verification message mapping to a match and recipient."""
     async with aiosqlite.connect(DB_PATH) as db:
-        now = datetime.utcnow().isoformat()
-        await db.execute(
-            """
-            INSERT OR REPLACE INTO verification_messages (message_id, match_id, guild_id, user_id, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (message_id, match_id, guild_id, user_id, now),
-        )
-        await db.commit()
+        try:
+            await db.execute(
+                """
+                INSERT OR REPLACE INTO verification_messages (message_id, match_id, guild_id, user_id)
+                VALUES (?, ?, ?, ?)
+                """,
+                (message_id, match_id, guild_id, user_id),
+            )
+            await db.commit()
+        except aiosqlite.OperationalError as e:
+            if "no such table: verification_messages" in str(e):
+                # Create the table and retry once
+                await db.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS verification_messages (
+                        message_id INTEGER PRIMARY KEY,
+                        match_id INTEGER NOT NULL,
+                        guild_id INTEGER,
+                        user_id INTEGER NOT NULL,
+                        created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+                    )
+                    """
+                )
+                await db.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_verif_match ON verification_messages(match_id)"
+                )
+                await db.commit()
+                # Retry the insert
+                await db.execute(
+                    """
+                    INSERT OR REPLACE INTO verification_messages (message_id, match_id, guild_id, user_id)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (message_id, match_id, guild_id, user_id),
+                )
+                await db.commit()
+            else:
+                raise
     log.debug("Recorded verification_message id=%s match=%s user=%s guild=%s", message_id, match_id, user_id, guild_id)
 
 async def get_verification_message(message_id: int) -> dict | None:
