@@ -11,8 +11,8 @@ import aiosqlite
 from collections import defaultdict
 from feather_rank.logging_config import setup_logging, get_logger
 from feather_rank.db import (
-    init_db, get_or_create_player, update_player, insert_match, top_players, recent_matches, DB_PATH,
-    has_accepted_tos, set_tos_accepted, get_match, get_match_participant_ids, get_signatures, set_match_status, add_signature,
+    get_or_create_player, update_player, insert_match, top_players, recent_matches, DB_PATH,
+    get_match, get_match_participant_ids, get_signatures, set_match_status, add_signature,
     insert_pending_match, list_pending_for_user, latest_pending_for_user
 )
 from feather_rank.mmr import apply_team_match
@@ -77,10 +77,20 @@ TOS_TEXT = (
     "Type /agree_tos to continue."
 )
 
+# Defensive wrapper around ToS acceptance check
+async def has_accepted_tos_safe(user_id: int) -> bool:
+    try:
+        return await db.has_accepted_tos(user_id)
+    except aiosqlite.OperationalError as e:
+        if "no such table: tos_acceptances" in str(e):
+            await db.init_db(DATABASE_PATH)
+            return await db.has_accepted_tos(user_id)
+        raise
+
 @bot.event
 async def on_ready():
-    # Initialize database
-    await init_db(DATABASE_PATH)
+    # Initialize database (use shim to ensure correct module's DB_PATH is set)
+    await db.init_db(DATABASE_PATH)
     # Warn users if running with in-memory (non-persistent) database
     if DATABASE_PATH.startswith("file::memory:") or DATABASE_PATH == ":memory:":
         log.warning("Ephemeral DB mode active: data will NOT be saved between restarts")
@@ -91,6 +101,8 @@ async def on_ready():
         await tree.sync(guild=guild)
         log.info("Commands synced to test guild %s only", TEST_GUILD_ID)
     else:
+        # Ensure DB init awaited before syncing commands
+        await db.init_db(DATABASE_PATH)
         await tree.sync()
         log.info("Commands synced globally")
     # Set bot status to "Playing Badminton"
@@ -104,6 +116,19 @@ async def on_ready():
         DATABASE_PATH,
     )
     log.debug("Presence set and startup complete")
+    
+    # Periodically ensure DB schema exists (idempotent) — best-effort
+    async def _db_ensure_tables_periodic():
+        while True:
+            try:
+                await db.init_db(DATABASE_PATH)
+            except Exception:
+                log.debug("Periodic DB schema ensure failed", exc_info=True)
+            await asyncio.sleep(600)
+    try:
+        asyncio.create_task(_db_ensure_tables_periodic())
+    except Exception:
+        pass
 
 @tree.command(name="ping", description="Replies with pong")
 async def ping(interaction: discord.Interaction):
@@ -111,7 +136,7 @@ async def ping(interaction: discord.Interaction):
 
 # --- ToS Agreement Helper ---
 async def require_tos(interaction: discord.Interaction) -> bool:
-    if not await has_accepted_tos(interaction.user.id):
+    if not await has_accepted_tos_safe(interaction.user.id):
         await interaction.response.send_message(
             "❗ Please run /agree_tos first to accept the Terms of Service.",
             ephemeral=True
@@ -119,16 +144,15 @@ async def require_tos(interaction: discord.Interaction) -> bool:
         return False
     return True
 
-@tree.command(name="agree_tos", description="Agree to the Terms and add your signed name")
+@tree.command(name="agree_tos", description="Agree to the Terms and record your name")
 @app_commands.describe(name="Your name as you want it recorded")
-async def agree_tos(interaction: discord.Interaction, name: str):
-    name = (name or "").strip()[:60]
-    await set_tos_accepted(interaction.user.id, version="v1", signed_name=name)
-    await interaction.response.send_message(
-        f"**ToS accepted.** Recorded name: `{name}`",
+async def agree_tos(inter: discord.Interaction, name: str):
+    await db.set_tos_accepted(inter.user.id, version="v1", signed_name=(name or "").strip()[:60])
+    await inter.response.send_message(
+        f"**ToS accepted.** Recorded name: `{(name or '').strip()[:60]}`",
         ephemeral=True
     )
-    log.info("User %s accepted ToS with name", interaction.user.id)
+    log.info("User %s accepted ToS with name", inter.user.id)
 
 @tree.command(name="match_doubles", description="Record a 2v2 badminton match")
 @app_commands.describe(
@@ -459,13 +483,16 @@ async def verify(
     name: str | None = None,
     match_id: int | None = None,
 ):
-    # Check ToS acceptance first
-    if not await db.has_accepted_tos(inter.user.id):
-        await inter.response.send_message(
-            "Please run /agree_tos name:<Your Name> first.",
+    # Ensure DB is initialized (safe to call repeatedly)
+    await db.init_db(DATABASE_PATH)
+
+    # Check ToS acceptance first (defensive: create table if missing)
+    accepted = await has_accepted_tos_safe(inter.user.id)
+    if not accepted:
+        return await inter.response.send_message(
+            "Please run `/agree_tos name:<Your Name>` first, then verify again.",
             ephemeral=True
         )
-        return
 
     await inter.response.defer(ephemeral=True)
 
@@ -753,7 +780,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     elif emoji == EMOJI_REJECT:  decision = "reject"
     else: return
 
-    if not await db.has_accepted_tos(payload.user_id):
+    if not await has_accepted_tos_safe(payload.user_id):
         ch = await bot.fetch_channel(payload.channel_id)
         try:
             msg = await ch.fetch_message(payload.message_id)

@@ -238,17 +238,16 @@ async def has_accepted_tos(user_id: int) -> bool:
 async def set_tos_accepted(user_id: int, version: str = "v1", signed_name: str | None = None) -> None:
     """Upsert ToS acceptance for a user with version and signed_name."""
     async with aiosqlite.connect(DB_PATH) as db:
-        now = datetime.utcnow().isoformat()
         await db.execute(
             """
             INSERT INTO tos_acceptances (user_id, accepted_at, version, signed_name)
-            VALUES (?, ?, ?, ?)
+            VALUES (?, strftime('%Y-%m-%dT%H:%M:%fZ','now'), ?, ?)
             ON CONFLICT(user_id) DO UPDATE SET
                 accepted_at = excluded.accepted_at,
                 version = excluded.version,
-                signed_name = excluded.signed_name
+                signed_name = COALESCE(excluded.signed_name, tos_acceptances.signed_name)
             """,
-            (user_id, now, version, signed_name)
+            (user_id, version, signed_name)
         )
         await db.commit()
     log.debug("set_tos_accepted user=%s version=%s name=%s", user_id, version, signed_name)
@@ -386,14 +385,14 @@ async def init_db(db_path: str = "feather_rank.db"):
             )
         """)
 
-        # Create tos_acceptances table (now includes signed_name)
+        # Create tos_acceptances table with defaults and signed_name
         await db.execute(
             """
-            CREATE TABLE IF NOT EXISTS tos_acceptances (
-                user_id INTEGER PRIMARY KEY,
-                accepted_at TEXT,
-                version TEXT,
-                signed_name TEXT
+            CREATE TABLE IF NOT EXISTS tos_acceptances(
+              user_id     INTEGER PRIMARY KEY,
+              accepted_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+              version     TEXT NOT NULL DEFAULT 'v1',
+              signed_name TEXT
             )
             """
         )
