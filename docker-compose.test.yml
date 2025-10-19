@@ -1,0 +1,18 @@
+services:
+  feather-rank-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.test
+    image: feather-rank:test
+    environment:
+      LOG_LEVEL: "DEBUG"
+      TEST_MODE: "1"
+      EPHEMERAL_DB: "1"
+      DATABASE_PATH: "/tmp/test_feather_rank_test.sqlite"
+    # use an anonymous/ephemeral volume for /tmp (container-local)
+    volumes:
+      - type: tmpfs
+        target: /tmp
+    # Tests should run and then the container will exit. Don't restart.
+    restart: "no"
+    # Default CMD in Dockerfile.test runs `python test.py` so no command override needed.

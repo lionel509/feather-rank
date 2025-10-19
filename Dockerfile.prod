@@ -17,8 +17,10 @@ RUN python -m pip install --upgrade pip \
 # Copy application source
 COPY . .
 
-# Ensure run scripts are executable (ignore if missing)
-RUN chmod +x run_prod.sh run_prod_ephemeral.sh || true
+# Fix Windows line endings and make scripts executable
+RUN apt-get update && apt-get install -y dos2unix && apt-get clean && rm -rf /var/lib/apt/lists/* \
+    && dos2unix run_prod.sh run_prod_ephemeral.sh 2>/dev/null || true \
+    && chmod +x run_prod.sh run_prod_ephemeral.sh || true
 
 # Runtime configuration
 ENV LOG_LEVEL=INFO \
