@@ -27,10 +27,16 @@ TEST_MODE = os.getenv('TEST_MODE', '0') in ('1', 'true', 'TRUE', 'yes')
 TEST_GUILD_ID = os.getenv('TEST_GUILD_ID')
 TEST_GUILD_ID = int(TEST_GUILD_ID) if TEST_GUILD_ID and TEST_GUILD_ID.isdigit() else None
 EPHEMERAL_DB = os.getenv('EPHEMERAL_DB', '0') in ('1', 'true', 'TRUE', 'yes')
-MENTIONS_PING = os.getenv("MENTIONS_PING", "1") in ("1", "true", "True", "yes")
-ALLOWED_MENTIONS = discord.AllowedMentions(users=MENTIONS_PING, roles=False, everyone=False)
+
+# --- Discord config and intents ---
 EMOJI_APPROVE = os.getenv("EMOJI_APPROVE", "✅")
 EMOJI_REJECT  = os.getenv("EMOJI_REJECT",  "❌")
+MENTIONS_PING = os.getenv("MENTIONS_PING","1").lower() in ("1","true","yes")
+ALLOWED_MENTIONS = discord.AllowedMentions(users=MENTIONS_PING, roles=False, everyone=False)
+
+intents = discord.Intents.default()
+intents.reactions = True
+# use these intents when constructing Bot(...)
 
 # Configuration
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
@@ -504,13 +510,14 @@ async def verify(
         await try_finalize_match(selected_id)
 
         # Send confirmation using fmt helpers
+        hint = fmt.block("/verify decision:approve name:YourName\n/verify decision:reject name:YourName", "md")
         msg = (
             f"{fmt.bold('Verification recorded')}\n"
             f"Match: {fmt.code(str(selected_id))}\n"
             f"Decision: {fmt.code(decision)}\n"
             f"Name: {fmt.code(name)}"
         )
-        await inter.followup.send(msg, ephemeral=True)
+        await inter.followup.send(msg + "\n\n" + hint, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
         log.info("Verify recorded: match=%s user=%s decision=%s name=%s", selected_id, inter.user.id, decision, name)
 
     except Exception as e:
