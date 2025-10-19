@@ -1,7 +1,5 @@
 
-````markdown
-
-## Project structure
+# Feather Rank
 
 - `feather_rank/` — Core package (db, rules, mmr, models, logging)
 - `app.py` — Bot entrypoint using the package modules
@@ -21,6 +19,14 @@
 - `/stats user` — Show player statistics
 - `/verify match_id decision name` — Verify a match result (approve/reject)
 - `/pending` — List your matches awaiting your verification
+ 
+ 
+### Emoji Verification
+
+- When a match is reported, each non-reporter participant gets a DM with the match summary.
+- React **✅** to approve or **❌** to reject. (Set emojis via `EMOJI_APPROVE`/`EMOJI_REJECT` env vars.)
+- If DMs are closed, the bot posts a private prompt in the match channel instead.
+- You must run `/agree_tos name:<Your Name>` once before reactions count.
 
 ### Test Bot (test_bot.py)
 

@@ -16,6 +16,7 @@ from feather_rank.db import (
     insert_pending_match, list_pending_for_user, latest_pending_for_user
 )
 from feather_rank.mmr import apply_team_match
+import db as db
 
 # Load environment variables and setup logging early
 load_dotenv()
@@ -28,6 +29,8 @@ TEST_GUILD_ID = int(TEST_GUILD_ID) if TEST_GUILD_ID and TEST_GUILD_ID.isdigit() 
 EPHEMERAL_DB = os.getenv('EPHEMERAL_DB', '0') in ('1', 'true', 'TRUE', 'yes')
 MENTIONS_PING = os.getenv("MENTIONS_PING", "1") in ("1", "true", "True", "yes")
 ALLOWED_MENTIONS = discord.AllowedMentions(users=MENTIONS_PING, roles=False, everyone=False)
+EMOJI_APPROVE = os.getenv("EMOJI_APPROVE", "✅")
+EMOJI_REJECT  = os.getenv("EMOJI_REJECT",  "❌")
 
 # Configuration
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
@@ -54,6 +57,7 @@ def get_guild_lock(guild_id: int | None) -> asyncio.Lock:
 # Setup minimal intents (no privileged intents needed)
 intents = discord.Intents.none()
 intents.guilds = True  # Required for guild commands
+intents.reactions = True  # Needed for on_raw_reaction_add
 
 # Create bot instance
 bot = discord.Client(intents=intents)
@@ -434,7 +438,7 @@ async def stats(interaction: discord.Interaction, user: discord.User):
 
 @tree.command(name="verify", description="Verify a pending match")
 @app_commands.describe(
-    match_id="(Optional) If omitted, uses your latest pending match",
+    match_id="Match ID to verify",
     decision="approve or reject",
     name="Your name as you want it recorded"
 )
@@ -444,83 +448,87 @@ async def stats(interaction: discord.Interaction, user: discord.User):
 ])
 async def verify(
     inter: discord.Interaction,
+    match_id: int,
     decision: str,
     name: str,
-    match_id: int | None = None,
 ):
     if not await require_tos(inter):
         return
-    # Default name if user didn’t type it
-    name = (name or "").strip()[:60]
-    if not name:
-        name = (inter.user.display_name or inter.user.name)[:60]
+    # Defer to avoid 3s interaction timeout; use followups afterwards
+    await inter.response.defer(ephemeral=True)
+    try:
+        # Default name if user didn’t type it
+        name = (name or "").strip()[:60]
+        if not name:
+            name = (inter.user.display_name or inter.user.name)[:60]
 
-    # Auto-pick latest pending match for this user if match_id is omitted
-    if match_id is None:
-        row = await latest_pending_for_user(inter.guild.id if inter.guild else 0, inter.user.id)
-        if not row:
-            await inter.response.send_message("No pending matches to verify.", ephemeral=True)
+        # Explicit match id required
+        selected_id: int = int(match_id)
+
+        # Validate match and permissions
+        match = await get_match(selected_id)
+        if not match:
+            await inter.followup.send(f"❌ Match ID {selected_id} not found.", ephemeral=True)
+            log.warning("Verify failed: match not found id=%s user=%s", selected_id, inter.user.id)
             return
-        selected_id: int = int(row["id"])  # ensure concrete int
-    else:
-        selected_id = int(match_id)
+        participants = await get_match_participant_ids(selected_id)
+        if inter.user.id not in participants:
+            await inter.followup.send("❌ You are not a participant in this match.", ephemeral=True)
+            log.warning("Verify blocked: non-participant user=%s match=%s", inter.user.id, selected_id)
+            return
+        if inter.user.id == match.get("reporter"):
+            await inter.followup.send("❌ The reporter cannot verify their own match.", ephemeral=True)
+            log.warning("Verify blocked: reporter self-verify user=%s match=%s", inter.user.id, selected_id)
+            return
 
-    # Validate match and permissions
-    match = await get_match(selected_id)
-    if not match:
-        await inter.response.send_message(f"❌ Match ID {selected_id} not found.", ephemeral=True)
-        log.warning("Verify failed: match not found id=%s user=%s", selected_id, inter.user.id)
-        return
-    participants = await get_match_participant_ids(selected_id)
-    if inter.user.id not in participants:
-        await inter.response.send_message("❌ You are not a participant in this match.", ephemeral=True)
-        log.warning("Verify blocked: non-participant user=%s match=%s", inter.user.id, selected_id)
-        return
-    if inter.user.id == match.get("reporter"):
-        await inter.response.send_message("❌ The reporter cannot verify their own match.", ephemeral=True)
-        log.warning("Verify blocked: reporter self-verify user=%s match=%s", inter.user.id, selected_id)
-        return
+        # Record signature
+        await add_signature(selected_id, inter.user.id, decision, name)
+        signatures = await get_signatures(selected_id)
 
-    # Record signature
-    await add_signature(selected_id, inter.user.id, decision, name)
-    signatures = await get_signatures(selected_id)
+        # Handle rejection immediately
+        if any(sig["decision"] == "reject" for sig in signatures):
+            await set_match_status(selected_id, "rejected")
+            log.info("Match #%s rejected by user=%s", selected_id, inter.user.id)
+            reporter_id = match.get("reporter")
+            if reporter_id:
+                try:
+                    user = await bot.fetch_user(reporter_id)
+                    await user.send(f"❌ Your match (ID: {selected_id}) was rejected by a participant.")
+                except Exception:
+                    pass
+            await inter.followup.send(
+                f"**Verification recorded** for Match #{selected_id} as `{name}` (reject).",
+                ephemeral=True,
+            )
+            return
 
-    # Handle rejection immediately
-    if any(sig["decision"] == "reject" for sig in signatures):
-        await set_match_status(selected_id, "rejected")
-        log.info("Match #%s rejected by user=%s", selected_id, inter.user.id)
-        reporter_id = match.get("reporter")
-        if reporter_id:
-            try:
-                user = await bot.fetch_user(reporter_id)
-                await user.send(f"❌ Your match (ID: {selected_id}) was rejected by a participant.")
-            except Exception:
-                pass
-        await inter.response.send_message(
-            f"**Verification recorded** for Match #{selected_id} as `{name}` (reject).",
+        # Finalize if all approvals are present
+        non_reporters = [pid for pid in participants if pid != match.get("reporter")]
+        if all(
+            any(sig["user_id"] == pid and sig["decision"] == "approve" for sig in signatures)
+            for pid in non_reporters
+        ):
+            await finalize_match(selected_id)
+            log.info("Match #%s finalized (all signatures collected)", selected_id)
+            await inter.followup.send(
+                f"**Verification recorded** for Match #{selected_id} as `{name}` (approve).",
+                ephemeral=True,
+            )
+            return
+
+        # Otherwise, just confirm recording
+        await inter.followup.send(
+            f"**Verification recorded** for Match #{selected_id} as `{name}` ({decision}).",
             ephemeral=True,
         )
-        return
-
-    # Finalize if all approvals are present
-    non_reporters = [pid for pid in participants if pid != match.get("reporter")]
-    if all(
-        any(sig["user_id"] == pid and sig["decision"] == "approve" for sig in signatures)
-        for pid in non_reporters
-    ):
-        await finalize_match(selected_id)
-        log.info("Match #%s finalized (all signatures collected)", selected_id)
-        await inter.response.send_message(
-            f"**Verification recorded** for Match #{selected_id} as `{name}` (approve).",
-            ephemeral=True,
-        )
-        return
-
-    # Otherwise, just confirm recording
-    await inter.response.send_message(
-        f"**Verification recorded** for Match #{selected_id} as `{name}` ({decision}).",
-        ephemeral=True,
-    )
+    except Exception as e:
+        log.exception("Error in /verify for user=%s", inter.user.id)
+        # Ensure the user gets feedback even on unexpected errors
+        try:
+            await inter.followup.send(f"❌ Failed to verify: {e}", ephemeral=True)
+        except Exception:
+            # If followup somehow fails (rare), ignore to avoid crashing
+            pass
 
 @tree.command(name="pending", description="List your matches awaiting your verification")
 async def pending(interaction: discord.Interaction):
@@ -590,7 +598,7 @@ async def pending(interaction: discord.Interaction):
         rows.append([f"#{mid}", str(mode), teams, sets_str])
 
     table = fmt.mono_table(rows, headers=headers)
-    hint = "Run `/verify decision:approve name:Your Name`"
+    hint = "Run `/verify match_id:<ID> decision:approve name:Your Name`"
     await interaction.followup.send(table + "\n" + hint, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
     log.debug("Listed %s pending matches for user=%s guild=%s", len(rows), user_id, guild_id)
 
@@ -692,19 +700,180 @@ async def notify_verification(match_id: int):
         set_scores = []
     set_line = fmt.score_sets(set_scores) if set_scores else "N/A"
     title = fmt.bold(f"Please verify Match #{match_id}")
+    tip = fmt.block(
+        "/verify match_id:<ID> decision:approve name:Your Name\n/verify match_id:<ID> decision:reject name:Your Name",
+        "md",
+    )
+    base_msg = (
+        f"{title}\n"
+        f"{team_line}\n"
+        f"{set_line}\n"
+        f"React {EMOJI_APPROVE} to approve or {EMOJI_REJECT} to reject.\n\n{tip}"
+    )
     for user_id in non_reporters:
         try:
             user = await bot.fetch_user(user_id)
-            nm = await fmt.display_name_or_cached(bot, guild, user_id)
-            msg = (
-                f"{title}\n"
-                f"{team_line}\n"
-                f"{set_line}\n"
-                f"Use `/verify decision:approve name:{nm}` or `/verify decision:reject name:{nm}`"
-            )
-            await user.send(msg, allowed_mentions=ALLOWED_MENTIONS)
+            # Personalize with concrete match id
+            msg = base_msg.replace("match_id:<ID>", f"match_id:{match_id}")
+            dm = await user.send(msg, allowed_mentions=ALLOWED_MENTIONS)
+            # Add approve/reject reactions and record mapping
+            try:
+                await dm.add_reaction(EMOJI_APPROVE)
+            except Exception:
+                log.debug("Failed to add approve reaction for user=%s match=%s", user_id, match_id, exc_info=True)
+            try:
+                await dm.add_reaction(EMOJI_REJECT)
+            except Exception:
+                log.debug("Failed to add reject reaction for user=%s match=%s", user_id, match_id, exc_info=True)
+            try:
+                await db.record_verification_message(dm.id, match_id, guild_id=guild_id, user_id=user_id)
+            except Exception:
+                log.warning("Failed to record verification_message for dm=%s match=%s", dm.id if 'dm' in locals() else None, match_id, exc_info=True)
+        except discord.Forbidden:
+            # Fallback: post in a visible channel (system channel or any text channel) mentioning only this participant
+            try:
+                post_text = f"{fmt.mention(user_id)}\n{base_msg.replace('match_id:<ID>', f'match_id:{match_id}')}"
+                channel = None
+                if guild and getattr(guild, "system_channel", None):
+                    channel = guild.system_channel
+                # Find first text channel we can send in
+                if channel is None:
+                    for ch in getattr(guild, "channels", []) or []:
+                        if isinstance(ch, discord.TextChannel) and ch.permissions_for(ch.guild.me).send_messages:
+                            channel = ch
+                            break
+                if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
+                    ch_msg = await channel.send(post_text, allowed_mentions=ALLOWED_MENTIONS)
+                    try:
+                        await ch_msg.add_reaction(EMOJI_APPROVE)
+                    except Exception:
+                        pass
+                    try:
+                        await ch_msg.add_reaction(EMOJI_REJECT)
+                    except Exception:
+                        pass
+                    try:
+                        await db.record_verification_message(ch_msg.id, match_id, guild_id=guild_id, user_id=user_id)
+                    except Exception:
+                        log.warning("Failed to record channel verification_message for match=%s", match_id, exc_info=True)
+                else:
+                    log.warning("No suitable channel to post verification for user=%s match=%s", user_id, match_id)
+            except Exception:
+                log.warning("Channel fallback failed for user=%s match=%s", user_id, match_id, exc_info=True)
         except Exception:
             log.warning("Failed to DM user=%s for verification of match=%s", user_id, match_id, exc_info=True)
+
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    # Ignore bot’s own reactions
+    if not bot.user or payload.user_id == bot.user.id:
+        return
+
+    # Only watch our tracked messages
+    try:
+        row = await db.get_verification_message(payload.message_id)
+    except Exception:
+        row = None
+    if not row:
+        return
+
+    # Only the intended participant may react-count
+    if payload.user_id != row.get("user_id"):
+        return
+
+    # Decision from emoji
+    emoji = str(payload.emoji)
+    if emoji == EMOJI_APPROVE:
+        decision = "approve"
+    elif emoji == EMOJI_REJECT:
+        decision = "reject"
+    else:
+        return
+
+    # Name capture requirement: if no ToS name, ask for it and abort
+    try:
+        if not await db.has_accepted_tos(payload.user_id):
+            ch = await bot.fetch_channel(payload.channel_id)
+            if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+                msg = await ch.fetch_message(payload.message_id)
+                await msg.reply("Please run `/agree_tos name:<Your Name>` first, then react again.", mention_author=False)
+            return
+    except Exception:
+        # If we can't confirm ToS, bail quietly
+        return
+
+    # Use ToS signed name; fallback to current display name
+    try:
+        tos = await db.get_tos(payload.user_id)
+    except Exception:
+        tos = None
+    signed_name = None
+    if tos and tos.get("signed_name"):
+        signed_name = tos.get("signed_name")
+    else:
+        # Try to resolve nick/display
+        if payload.member and getattr(payload.member, "nick", None):
+            signed_name = payload.member.nick
+        else:
+            # Fetch user for username fallback
+            try:
+                u = await bot.fetch_user(payload.user_id)
+                signed_name = getattr(u, "display_name", None) or u.name
+            except Exception:
+                signed_name = "Unknown"
+
+    # Record signature
+    try:
+        await db.add_signature(row["match_id"], payload.user_id, decision, signed_name)
+    except Exception:
+        # Try to inform user
+        try:
+            ch = await bot.fetch_channel(payload.channel_id)
+            if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+                msg = await ch.fetch_message(payload.message_id)
+                await msg.reply("Failed to record verification. Please use `/verify` instead.", mention_author=False)
+        except Exception:
+            pass
+        return
+
+    # Consume mapping to avoid double-count
+    try:
+        await db.delete_verification_message(payload.message_id)
+    except Exception:
+        pass
+
+    # Try to confirm back
+    try:
+        ch = await bot.fetch_channel(payload.channel_id)
+        if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
+            msg = await ch.fetch_message(payload.message_id)
+            await msg.reply(f"Verification recorded as `{signed_name}` ({decision}).", mention_author=False)
+    except Exception:
+        pass
+
+    # Check finalize
+    try:
+        await try_finalize_match(row["match_id"])
+    except Exception:
+        log.warning("Failed try_finalize_match for match=%s", row.get("match_id"), exc_info=True)
+
+async def try_finalize_match(match_id: int):
+    """If all non-reporters approved (and none rejected), finalize match; else if any reject, mark rejected.
+    Mirrors the checks performed in /verify to keep flows consistent.
+    """
+    match = await get_match(match_id)
+    if not match:
+        return
+    participants = await get_match_participant_ids(match_id)
+    sigs = await get_signatures(match_id)
+    # Any reject => reject
+    if any(s.get("decision") == "reject" for s in sigs):
+        await set_match_status(match_id, "rejected")
+        return
+    # All non-reporters approved?
+    non_reporters = [pid for pid in participants if pid != match.get("reporter")]
+    if all(any(s.get("user_id") == pid and s.get("decision") == "approve" for s in sigs) for pid in non_reporters):
+        await finalize_match(match_id)
 
 # Run the bot
 if __name__ == "__main__":

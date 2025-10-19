@@ -243,6 +243,17 @@ async def set_tos_accepted(user_id: int, version: str = "v1", signed_name: str |
         await db.commit()
     log.debug("set_tos_accepted user=%s version=%s name=%s", user_id, version, signed_name)
 
+async def get_tos(user_id: int) -> dict | None:
+    """Return ToS acceptance row for a user, including signed_name if present."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM tos_acceptances WHERE user_id = ?",
+            (user_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
 import aiosqlite
 from datetime import datetime
 from typing import Optional
@@ -381,8 +392,56 @@ async def init_db(db_path: str = "feather_rank.db"):
         if not await table_has_column("tos_acceptances", "signed_name", DB_PATH):
             await db.execute("ALTER TABLE tos_acceptances ADD COLUMN signed_name TEXT")
 
+        # Create verification_messages to track DM or channel verification prompts
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS verification_messages(
+              message_id INTEGER PRIMARY KEY,
+              match_id INTEGER NOT NULL,
+              guild_id INTEGER,
+              user_id INTEGER NOT NULL,
+              created_at TEXT
+            )
+            """
+        )
+
         await db.commit()
     log.debug("Initialized database at %s", DB_PATH)
+
+async def record_verification_message(message_id: int, match_id: int, guild_id: int | None, user_id: int) -> None:
+    """Record a verification message mapping to a match and recipient."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        now = datetime.utcnow().isoformat()
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO verification_messages (message_id, match_id, guild_id, user_id, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (message_id, match_id, guild_id, user_id, now),
+        )
+        await db.commit()
+    log.debug("Recorded verification_message id=%s match=%s user=%s guild=%s", message_id, match_id, user_id, guild_id)
+
+async def get_verification_message(message_id: int) -> dict | None:
+    """Fetch a verification message row by message_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM verification_messages WHERE message_id = ?",
+            (message_id,),
+        ) as cursor:
+            row = await cursor.fetchone()
+            return dict(row) if row else None
+
+async def delete_verification_message(message_id: int) -> None:
+    """Delete a verification message mapping by message_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM verification_messages WHERE message_id = ?",
+            (message_id,),
+        )
+        await db.commit()
+    log.debug("Deleted verification_message id=%s", message_id)
 
 async def get_or_create_player(user_id: int, username: str, base_rating: float = 1200) -> dict:
     """Get existing player or create new one."""
