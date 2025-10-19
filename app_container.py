@@ -354,9 +354,8 @@ async def leaderboard(interaction: discord.Interaction, limit: int = 20):
         uid = int(uid_val) if uid_val is not None else 0
         stored_username = str(player.get('username', f'User{uid or "?"}'))
         name = await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=stored_username) if uid else stored_username
-        mention_str = f"@silent {fmt.mention(uid)}" if uid else stored_username
         wl = f"{player.get('wins', 0)}-{player.get('losses', 0)}"
-        line = f"{idx}. {mention_str} — {name} — {player.get('rating', 0):.1f} ({wl})"
+        line = f"{idx}. {name} — {player.get('rating', 0):.1f} ({wl})"
         lines.append(line)
 
     content = "**" + title + "**\n" + "\n".join(lines)
@@ -378,7 +377,8 @@ async def stats(interaction: discord.Interaction, user: discord.User):
             player = dict(row) if row else None
 
     if not player:
-        await interaction.followup.send(f"📊 @silent {user.mention} has no games recorded yet.")
+        user_display = user.display_name if hasattr(user, 'display_name') and user.display_name else user.name
+        await interaction.followup.send(f"📊 {user_display} has no games recorded yet.")
         return
 
     # Get player stats
@@ -393,9 +393,12 @@ async def stats(interaction: discord.Interaction, user: discord.User):
     )
 
     # Build KV section with bold keys and inline code numbers
+    rating_str = f"{player['rating']:.1f}"
+    wl_str = f"{player['wins']}-{player['losses']}"
+    win_rate_str = f"{win_rate:.1f}%"
     kv_lines = [
-        f"{fmt.bold('Rating')}: {fmt.code(f'{player['rating']:.1f}')}",
-        f"{fmt.bold('Record')}: {fmt.code(f"{player['wins']}-{player['losses']}")} ({fmt.code(f'{win_rate:.1f}%')})",
+        f"{fmt.bold('Rating')}: {fmt.code(rating_str)}",
+        f"{fmt.bold('Record')}: {fmt.code(wl_str)} ({fmt.code(win_rate_str)})",
         f"{fmt.bold('Total Matches')}: {fmt.code(str(total_matches))}",
     ]
 
@@ -427,8 +430,9 @@ async def stats(interaction: discord.Interaction, user: discord.User):
     else:
         recent_block = "*No recent matches found.*"
 
+    user_display = user.display_name if hasattr(user, 'display_name') and user.display_name else user.name
     message = (
-        f"## 📊 Stats for {user.mention}\n\n"
+        f"## 📊 Stats for {user_display}\n\n"
         + "\n".join(kv_lines)
         + (f"\n\n**Recent Matches (Last {len(matches)}):**\n" + recent_block if matches else f"\n\n{recent_block}")
     )
@@ -582,10 +586,10 @@ async def pending(interaction: discord.Interaction):
         mode = match.get('mode', '')
         team_a_ids = [int(x) for x in match.get('team_a', '').split(',') if x]
         team_b_ids = [int(x) for x in match.get('team_b', '').split(',') if x]
-        # Build team strings with mentions
-        a_mentions = [f"@silent {fmt.mention(uid)}" for uid in team_a_ids]
-        b_mentions = [f"@silent {fmt.mention(uid)}" for uid in team_b_ids]
-        teams = f"{'/'.join(a_mentions)} vs {'/'.join(b_mentions)}"
+        # Build team strings with usernames (no pings)
+        a_names = [await name_cache[uid] for uid in team_a_ids]
+        b_names = [await name_cache[uid] for uid in team_b_ids]
+        teams = f"{'/'.join(a_names)} vs {'/'.join(b_names)}"
         # Sets: parse set_scores and format using fmt.score_sets; fallback to N/A
         try:
             set_scores = json.loads(match.get('set_scores') or '[]')
@@ -685,15 +689,15 @@ async def notify_verification(match_id: int):
     participants = await get_match_participant_ids(match_id)
     reporter = match.get("reporter")
     non_reporters = [uid for uid in participants if uid != reporter]
-    # Build formatted message with mentions and display names
+    # Build formatted message with display names
     guild_id = match.get('guild_id')
     guild = bot.get_guild(guild_id) if guild_id else None
-    # Teams as mention strings
+    # Teams as display name strings (no pings)
     team_a_ids = [int(x) for x in (match.get('team_a') or '').split(',') if x]
     team_b_ids = [int(x) for x in (match.get('team_b') or '').split(',') if x]
-    team_a_mentions = [fmt.mention(uid) for uid in team_a_ids]
-    team_b_mentions = [fmt.mention(uid) for uid in team_b_ids]
-    team_line = f"{'/'.join(team_a_mentions)} vs {'/'.join(team_b_mentions)}"
+    team_a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_a_ids]
+    team_b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_b_ids]
+    team_line = f"{'/'.join(team_a_names)} vs {'/'.join(team_b_names)}"
     # Set scores line
     try:
         set_scores = json.loads(match.get('set_scores') or '[]')
@@ -733,7 +737,8 @@ async def notify_verification(match_id: int):
         except discord.Forbidden:
             # Fallback: post in a visible channel (system channel or any text channel) mentioning only this participant
             try:
-                post_text = f"@silent {fmt.mention(user_id)}\n{base_msg.replace('match_id:<ID>', f'match_id:{match_id}') }"
+                user_name = await fmt.display_name_or_cached(bot, guild, user_id, fallback=f"User{user_id}")
+                post_text = f"{user_name}\n{base_msg.replace('match_id:<ID>', f'match_id:{match_id}') }"
                 channel = None
                 if guild and getattr(guild, "system_channel", None):
                     channel = guild.system_channel

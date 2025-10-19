@@ -15,10 +15,7 @@ services:
       DATABASE_PATH: "/data/smashcord_prod.sqlite"
       # DISCORD_TOKEN will be loaded from .env file if it exists
     volumes:
-      - feather_data:/data
+      # Bind mount to view persistent data at ./data on the host
+      - ./data:/data
     # Default command is declared in the Dockerfile (./run_prod.sh runs app.py)
     restart: unless-stopped
-
-volumes:
-  feather_data:
-    driver: local

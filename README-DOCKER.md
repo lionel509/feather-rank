@@ -30,7 +30,7 @@ docker compose -f docker-compose.prod.yml down -v
 ### What it runs
 - **Container**: `feather-rank`
 - **Command**: `./run_prod.sh` → `python app.py` (Discord bot)
-- **Database**: `/data/smashcord_prod.sqlite` (persistent, stored in Docker volume)
+- **Database**: `/data/smashcord_prod.sqlite` inside the container, bind-mounted to `./data/smashcord_prod.sqlite` on your host
 - **Environment**: `TEST_MODE=0`, `EPHEMERAL_DB=0`
 
 ---
@@ -83,3 +83,7 @@ Make sure you're using the correct compose file:
 docker ps
 ```
 Look at the `COMMAND` column to see what each container is executing.
+
+### Where is my data?
+- With the production compose file, your database is persisted in the repo's `./data` folder on the host.
+- You should see a file like `./data/smashcord_prod.sqlite` after the bot starts.

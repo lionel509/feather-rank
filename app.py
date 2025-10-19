@@ -11,12 +11,12 @@ import aiosqlite
 from collections import defaultdict
 from feather_rank.logging_config import setup_logging, get_logger
 from feather_rank.db import (
-    get_or_create_player, update_player, insert_match, top_players, recent_matches, DB_PATH,
+    get_or_create_player, update_player, insert_match, top_players, recent_matches,
     get_match, get_match_participant_ids, get_signatures, set_match_status, add_signature,
     insert_pending_match, list_pending_for_user, latest_pending_for_user
 )
 from feather_rank.mmr import apply_team_match
-import db as db
+from feather_rank import db as db
 
 # Load environment variables and setup logging early
 load_dotenv()
@@ -384,9 +384,8 @@ async def leaderboard(interaction: discord.Interaction, limit: int = 20):
         uid = int(uid_val) if uid_val is not None else 0
         stored_username = str(player.get('username', f'User{uid or "?"}'))
         name = await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=stored_username) if uid else stored_username
-        mention_str = f"@silent {fmt.mention(uid)}" if uid else stored_username
         wl = f"{player.get('wins', 0)}-{player.get('losses', 0)}"
-        line = f"{idx}. {mention_str} — {name} — {player.get('rating', 0):.1f} ({wl})"
+        line = f"{idx}. {name} — {player.get('rating', 0):.1f} ({wl})"
         lines.append(line)
 
     content = "**" + title + "**\n" + "\n".join(lines)
@@ -399,7 +398,7 @@ async def stats(interaction: discord.Interaction, user: discord.User):
     await interaction.response.defer()
 
     # Try to get existing player (don't create)
-    async with aiosqlite.connect(DB_PATH) as db:
+    async with aiosqlite.connect(db.DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM players WHERE user_id = ?", (user.id,)
@@ -408,7 +407,8 @@ async def stats(interaction: discord.Interaction, user: discord.User):
             player = dict(row) if row else None
 
     if not player:
-        await interaction.followup.send(f"📊 @silent {user.mention} has no games recorded yet.")
+        user_display = user.display_name if hasattr(user, 'display_name') and user.display_name else user.name
+        await interaction.followup.send(f"📊 {user_display} has no games recorded yet.")
         return
 
     # Get player stats
@@ -423,9 +423,12 @@ async def stats(interaction: discord.Interaction, user: discord.User):
     )
 
     # Build KV section with bold keys and inline code numbers
+    rating_str = f"{player['rating']:.1f}"
+    wl_str = f"{player['wins']}-{player['losses']}"
+    win_rate_str = f"{win_rate:.1f}%"
     kv_lines = [
-        f"{fmt.bold('Rating')}: {fmt.code(f'{player['rating']:.1f}')}",
-        f"{fmt.bold('Record')}: {fmt.code(f"{player['wins']}-{player['losses']}")} ({fmt.code(f'{win_rate:.1f}%')})",
+        f"{fmt.bold('Rating')}: {fmt.code(rating_str)}",
+        f"{fmt.bold('Record')}: {fmt.code(wl_str)} ({fmt.code(win_rate_str)})",
         f"{fmt.bold('Total Matches')}: {fmt.code(str(total_matches))}",
     ]
 
@@ -457,8 +460,9 @@ async def stats(interaction: discord.Interaction, user: discord.User):
     else:
         recent_block = "*No recent matches found.*"
 
+    user_display = user.display_name if hasattr(user, 'display_name') and user.display_name else user.name
     message = (
-        f"## 📊 Stats for {user.mention}\n\n"
+        f"## 📊 Stats for {user_display}\n\n"
         + "\n".join(kv_lines)
         + (f"\n\n**Recent Matches (Last {len(matches)}):**\n" + recent_block if matches else f"\n\n{recent_block}")
     )
@@ -606,10 +610,10 @@ async def pending(interaction: discord.Interaction):
         mode = match.get('mode', '')
         team_a_ids = [int(x) for x in match.get('team_a', '').split(',') if x]
         team_b_ids = [int(x) for x in match.get('team_b', '').split(',') if x]
-        # Build team strings with mentions
-        a_mentions = [f"@silent {fmt.mention(uid)}" for uid in team_a_ids]
-        b_mentions = [f"@silent {fmt.mention(uid)}" for uid in team_b_ids]
-        teams = f"{'/'.join(a_mentions)} vs {'/'.join(b_mentions)}"
+        # Build team strings with usernames (no pings)
+        a_names = [await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=f"User{uid}") for uid in team_a_ids]
+        b_names = [await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=f"User{uid}") for uid in team_b_ids]
+        teams = f"{'/'.join(a_names)} vs {'/'.join(b_names)}"
         # Sets: parse set_scores and format using fmt.score_sets; fallback to N/A
         try:
             set_scores = json.loads(match.get('set_scores') or '[]')
@@ -716,12 +720,12 @@ async def notify_verification(match_id: int):
     # Build Markdown message
     title = fmt.bold(f"Please verify Match #{match_id}")
     
-    # Teams as "A vs B" string using fmt.mention for each user id
+    # Teams as "A vs B" string using display names for each user id
     team_a_ids = [int(x) for x in (match.get('team_a') or '').split(',') if x]
     team_b_ids = [int(x) for x in (match.get('team_b') or '').split(',') if x]
-    team_a_mentions = [fmt.mention(uid) for uid in team_a_ids]
-    team_b_mentions = [fmt.mention(uid) for uid in team_b_ids]
-    teams = f"{'/'.join(team_a_mentions)} vs {'/'.join(team_b_mentions)}"
+    team_a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_a_ids]
+    team_b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_b_ids]
+    teams = f"{'/'.join(team_a_names)} vs {'/'.join(team_b_names)}"
     
     # Sets using fmt.score_sets
     try:
@@ -845,13 +849,16 @@ async def try_finalize_match(match_id: int):
         
         # Build rejection summary with Markdown
         title = fmt.bold(f"Match #{match_id} Rejected")
-        teams_line = f"{'/'.join(fmt.mention(uid) for uid in team_a_ids)} vs {'/'.join(fmt.mention(uid) for uid in team_b_ids)}"
+        guild = bot.get_guild(match.get('guild_id')) if match.get('guild_id') else None
+        team_a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_a_ids]
+        team_b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_b_ids]
+        teams_line = f"{'/'.join(team_a_names)} vs {'/'.join(team_b_names)}"
         
         # Include who rejected
         rejectors = [s.get("user_id") for s in sigs if s.get("decision") == "reject"]
-        rejector_mentions = ", ".join(fmt.mention(uid) for uid in rejectors if uid)
+        rejector_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in rejectors if uid]
         
-        rejection_msg = f"{title}\n{teams_line}\nRejected by: {rejector_mentions}"
+        rejection_msg = f"{title}\n{teams_line}\nRejected by: {', '.join(rejector_names)}"
         
         # Notify reporter
         if reporter:
@@ -931,19 +938,19 @@ async def try_finalize_match(match_id: int):
     
     log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, points_a, points_b)
     
-    # Post public summary (channel/thread) with mentions and display names
+    # Post public summary (channel/thread) with display names only (no pings)
     title = fmt.bold(f"🏸 Match #{match_id} Verified!")
     
-    # Build team lines with mentions + display names
+    # Build team lines with display names
     team_a_lines = []
     for uid in team_a_ids:
         display = await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}")
-        team_a_lines.append(f"{fmt.mention(uid)} — {display}")
+        team_a_lines.append(f"{display}")
     
     team_b_lines = []
     for uid in team_b_ids:
         display = await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}")
-        team_b_lines.append(f"{fmt.mention(uid)} — {display}")
+        team_b_lines.append(f"{display}")
     
     teams_section = f"**Team A:**\n" + "\n".join(team_a_lines) + f"\n\n**Team B:**\n" + "\n".join(team_b_lines)
     
@@ -983,5 +990,17 @@ if __name__ == "__main__":
     if not TOKEN:
         log.error("DISCORD_TOKEN not set. Please provide it via environment or .env file.")
         raise SystemExit(1)
+    # Ensure DB schema exists before logging in the bot
+    try:
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        if loop.is_running():
+            # In case of being embedded, schedule init
+            loop.create_task(db.init_db(DATABASE_PATH))
+        else:
+            loop.run_until_complete(db.init_db(DATABASE_PATH))
+    except Exception:
+        # Best effort; on_ready will also ensure
+        log.debug("Pre-start DB init failed", exc_info=True)
     log.info("Starting bot… (mode=%s)", "TEST" if TEST_MODE else "PROD")
     bot.run(TOKEN)

@@ -17,14 +17,29 @@ async def insert_pending_match_points(
         team_a_str = ",".join(map(str, team_a))
         team_b_str = ",".join(map(str, team_b))
         set_scores_str = json.dumps(set_scores)
-        cursor = await db.execute(
-            """
-            INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b, set_winners, winner)
-            VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, NULL, NULL)
-            """,
-            (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter)
-        )
-        await db.commit()
+        try:
+            cursor = await db.execute(
+                """
+                INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b, set_winners, winner)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, NULL, NULL)
+                """,
+                (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter)
+            )
+            await db.commit()
+        except aiosqlite.OperationalError as e:
+            if "no such table: matches" in str(e):
+                # Ensure schema then retry once
+                await init_db(DB_PATH)
+                cursor = await db.execute(
+                    """
+                    INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b, set_winners, winner)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, NULL, NULL)
+                    """,
+                    (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter)
+                )
+                await db.commit()
+            else:
+                raise
     match_id = cursor.lastrowid if cursor.lastrowid is not None else -1
     log.debug("Inserted pending points match id=%s guild=%s mode=%s A=%s B=%s", match_id, guild_id, mode, team_a_str, team_b_str)
     return match_id
