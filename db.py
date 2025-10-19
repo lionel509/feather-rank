@@ -171,6 +171,61 @@ async def list_pending_for_user(user_id: int, guild_id: int) -> list[dict]:
             log.debug("Pending matches for user=%s guild=%s -> %s", user_id, guild_id, len(out))
             return out
 
+async def latest_pending_for_user(guild_id: int, user_id: int) -> dict | None:
+    """Return the most recent pending match for a user in a guild they haven't signed yet.
+
+    Conditions:
+    - matches.status = 'pending'
+    - user_id appears in team_a or team_b (CSV stored IDs)
+    - reporter != user_id (cannot be the reporter)
+    - user has not signed in match_signatures for that match
+    Ordered by id DESC, limited to 1.
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        like_params = (
+            f"{user_id},%",
+            f"%,{user_id},%",
+            f"%,{user_id}",
+        )
+        query = (
+            """
+            SELECT * FROM matches m
+            WHERE m.guild_id = ?
+              AND m.status = 'pending'
+              AND m.reporter != ?
+              AND (
+                  m.team_a LIKE ? OR m.team_a LIKE ? OR m.team_a LIKE ? OR m.team_a = ? OR
+                  m.team_b LIKE ? OR m.team_b LIKE ? OR m.team_b LIKE ? OR m.team_b = ?
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM match_signatures s
+                  WHERE s.match_id = m.id AND s.user_id = ?
+              )
+            ORDER BY m.id DESC
+            LIMIT 1
+            """
+        )
+        params = (
+            guild_id,
+            user_id,
+            *like_params,
+            str(user_id),
+            *like_params,
+            str(user_id),
+            user_id,
+        )
+        async with db.execute(query, params) as cursor:
+            row = await cursor.fetchone()
+            result = dict(row) if row else None
+            log.debug(
+                "latest_pending_for_user guild=%s user=%s -> %s",
+                guild_id,
+                user_id,
+                bool(result),
+            )
+            return result
+
 async def has_accepted_tos(user_id: int) -> bool:
     """Check if a user has accepted the ToS."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -180,16 +235,23 @@ async def has_accepted_tos(user_id: int) -> bool:
             log.debug("has_accepted_tos user=%s -> %s", user_id, accepted)
             return accepted
 
-async def set_tos_accepted(user_id: int, version: str = "v1") -> None:
-    """Set ToS acceptance for a user."""
+async def set_tos_accepted(user_id: int, version: str = "v1", signed_name: str | None = None) -> None:
+    """Upsert ToS acceptance for a user with version and signed_name."""
     async with aiosqlite.connect(DB_PATH) as db:
         now = datetime.utcnow().isoformat()
         await db.execute(
-            "INSERT OR REPLACE INTO tos_acceptances (user_id, accepted_at, version) VALUES (?, ?, ?)",
-            (user_id, now, version)
+            """
+            INSERT INTO tos_acceptances (user_id, accepted_at, version, signed_name)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                accepted_at = excluded.accepted_at,
+                version = excluded.version,
+                signed_name = excluded.signed_name
+            """,
+            (user_id, now, version, signed_name)
         )
         await db.commit()
-    log.debug("set_tos_accepted user=%s version=%s", user_id, version)
+    log.debug("set_tos_accepted user=%s version=%s name=%s", user_id, version, signed_name)
 
 import aiosqlite
 from datetime import datetime
@@ -313,14 +375,21 @@ async def init_db(db_path: str = "feather_rank.db"):
             )
         """)
 
-        # Create tos_acceptances table
-        await db.execute("""
+        # Create tos_acceptances table (now includes signed_name)
+        await db.execute(
+            """
             CREATE TABLE IF NOT EXISTS tos_acceptances (
                 user_id INTEGER PRIMARY KEY,
                 accepted_at TEXT,
-                version TEXT
+                version TEXT,
+                signed_name TEXT
             )
-        """)
+            """
+        )
+
+        # Ensure signed_name exists for older DBs
+        if not await table_has_column("tos_acceptances", "signed_name", DB_PATH):
+            await db.execute("ALTER TABLE tos_acceptances ADD COLUMN signed_name TEXT")
 
         await db.commit()
     log.debug("Initialized database at %s", DB_PATH)

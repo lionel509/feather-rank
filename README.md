@@ -142,3 +142,31 @@ Notes:
 - Provide your Discord bot token via `-e DISCORD_TOKEN=...` or a Docker secret mechanism in production.
 - Mount a host directory to `/data` to persist the database across container restarts.
 
+## Discord Message Formatting
+
+Messages use Discord Markdown for readability (bold headers, inline `code`, and fenced blocks like ```bash for shell).
+
+Example: match summary shown ephemerally after creating a pending match
+
+```
+**Match #123 — Pending Verification**
+Alice/Bob vs Carol/Dave
+21–18 | 19–21 | 22–20
+Use `/verify` to approve or `/verify decision:reject` to reject.
+```
+
+Example: shell commands in a fenced block
+
+```bash
+# Build the production image
+docker build -f Dockerfile.prod -t feather-rank:prod .
+
+# Run with a persistent DB volume
+docker run --rm -it \
+  -e DISCORD_TOKEN=your_token_here \
+  -e LOG_LEVEL=INFO \
+  -v $(pwd)/data:/data \
+  --name feather-rank-prod \
+  feather-rank:prod
+```
+
