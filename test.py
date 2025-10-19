@@ -14,7 +14,7 @@ async def test_database():
     print("🧪 Testing Database Operations...")
     
     # Import after setting test DB path
-    import db
+    from feather_rank import db
     
     # Use test database
     test_db_path = "test_feather_rank.db"
@@ -96,7 +96,7 @@ def test_mmr():
     """Test MMR/ELO calculations"""
     print("🧪 Testing MMR Calculations...")
     
-    from mmr import expected, elo_delta, team_rating, apply_team_match
+    from feather_rank.mmr import expected, elo_delta, team_rating, apply_team_match
     
     # Test 1: Expected score
     print("  ✓ Testing expected score calculation...")
@@ -141,7 +141,7 @@ def test_models():
     """Test data models"""
     print("🧪 Testing Data Models...")
     
-    from models import Player, Match
+    from feather_rank.models import Player, Match
     
     # Test Player dataclass
     print("  ✓ Testing Player model...")
@@ -201,7 +201,7 @@ def test_config():
 
 async def test_tos():
     print("🧪 Testing ToS acceptance...")
-    import db
+    from feather_rank import db
     test_db_path = "test_feather_rank.db"
     await db.init_db(test_db_path)
     user_id = 55555

@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.sqlite
+*.db
+
+# Env/config
+.env
+.env.*
+
+# VCS
+.git
+.gitignore
+
+# OS / editor
+.DS_Store
+.vscode/
+
+# Docker
+Dockerfile
+Dockerfile.*
+!.dockerignore

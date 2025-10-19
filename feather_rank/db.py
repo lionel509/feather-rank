@@ -1,10 +1,7 @@
-"""Shim module for backward compatibility.
-
-This top-level module forwards imports to the packaged implementation in
-`feather_rank.db`. External code that imports `db` will continue to work.
-"""
-
-from feather_rank.db import *  # noqa: F401,F403
+# --- Points and Set Scores Helpers ---
+import json
+from .logging_config import get_logger
+log = get_logger(__name__)
 
 async def insert_pending_match_points(
     guild_id: int,
@@ -387,7 +384,10 @@ async def insert_match(
     winner: str,
     created_by: int
 ) -> int:
-    """Insert a new match record and return its ID."""
+    """Insert a new match record and return its ID.
+
+    Note: For legacy set-winner based matches. Reporter is set to created_by.
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         now = datetime.utcnow().isoformat()
         # Convert lists to comma-separated strings
@@ -396,10 +396,10 @@ async def insert_match(
         set_winners_str = ",".join(set_winners)
         cursor = await db.execute(
             """
-            INSERT INTO matches (guild_id, mode, team_a, team_b, set_winners, winner, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO matches (guild_id, mode, team_a, team_b, set_winners, winner, created_by, created_at, reporter)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (guild_id, mode, team_a_str, team_b_str, set_winners_str, winner, created_by, now),
+            (guild_id, mode, team_a_str, team_b_str, set_winners_str, winner, created_by, now, created_by),
         )
         await db.commit()
         new_id = cursor.lastrowid if cursor.lastrowid is not None else -1

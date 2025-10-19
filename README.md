@@ -1,4 +1,13 @@
 
+````markdown
+
+## Project structure
+
+- `feather_rank/` — Core package (db, rules, mmr, models, logging)
+- `app.py` — Bot entrypoint using the package modules
+- `test.py`, `test_bot_run.py` — Local tests and a minimal test bot
+- `Dockerfile.*`, `Makefile`, `run_prod*.sh` — Ops scripts
+
 ## Commands
 
 ### Core Badminton Bot
@@ -53,4 +62,83 @@ LOG_LEVEL=DEBUG  # or INFO, WARNING, ERROR
 ```
 
 The same applies to `test_bot_run.py`. For Docker, you can pass `-e LOG_LEVEL=DEBUG` when running the container.
+
+## Test Mode (full app, prod features)
+
+Run the full bot with all production features, but using a separate test DB and optional fast, guild-only command sync:
+
+```bash
+# Use a separate DB by default and show [TEST MODE] in presence
+export TEST_MODE=1
+
+# Optional: sync commands to one guild immediately (much faster than global)
+export TEST_GUILD_ID=123456789012345678
+
+# Optional: noisy logs for debugging
+export LOG_LEVEL=DEBUG
+
+python app.py
+```
+
+Notes:
+
+- When TEST_MODE=1, the default DB path changes to ./test_feather_rank.sqlite unless DATABASE_PATH is explicitly set.
+- If TEST_GUILD_ID is provided, slash commands are synced only to that guild for instant availability.
+
+
+## Docker
+
+Two Dockerfiles are provided:
+
+- `Dockerfile.prod` — Production image that runs `./run_prod.sh` by default and persists the SQLite DB under `/data`.
+- `Dockerfile.test` — Test image that runs the built-in `test.py` suite by default (ephemeral DB), suitable for CI or local checks.
+
+Build images:
+
+```bash
+# Production
+docker build -f Dockerfile.prod -t feather-rank:prod .
+
+# Test
+docker build -f Dockerfile.test -t feather-rank:test .
+```
+
+Run containers:
+
+```bash
+# Production (mount persistent DB dir and pass token)
+docker run --rm -it \
+  -e DISCORD_TOKEN=your_token_here \
+  -e LOG_LEVEL=INFO \
+  -v $(pwd)/data:/data \
+  --name feather-rank-prod \
+  feather-rank:prod
+
+# Production ephemeral DB
+docker run --rm -it \
+  -e DISCORD_TOKEN=your_token_here \
+  -e EPHEMERAL_DB=1 \
+  -e LOG_LEVEL=INFO \
+  --name feather-rank-prod-ephemeral \
+  feather-rank:prod
+
+# Test suite (no token required)
+docker run --rm -it \
+  -e LOG_LEVEL=DEBUG \
+  --name feather-rank-test \
+  feather-rank:test
+
+# Optional: Minimal test bot (use test Docker image but override command)
+docker run --rm -it \
+  -e DISCORD_TOKEN=your_token_here \
+  -e TEST_MODE=1 \
+  -e LOG_LEVEL=DEBUG \
+  feather-rank:test python test_bot_run.py
+```
+
+Notes:
+
+- The production image runs as a non-root user and expects the database at `/data/smashcord.sqlite` by default.
+- Provide your Discord bot token via `-e DISCORD_TOKEN=...` or a Docker secret mechanism in production.
+- Mount a host directory to `/data` to persist the database across container restarts.
 

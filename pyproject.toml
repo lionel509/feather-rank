@@ -1,0 +1,9 @@
+[project]
+name = "feather-rank"
+version = "0.1.0"
+description = "Discord badminton ranking bot"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pyright]
+reportMissingImports = false

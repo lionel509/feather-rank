@@ -1,5 +1,5 @@
-from rules import valid_set, match_winner
-from db import insert_pending_match_points
+from feather_rank.rules import valid_set, match_winner
+from feather_rank.db import insert_pending_match_points
 import discord
 from discord import app_commands
 from dotenv import load_dotenv
@@ -7,23 +7,34 @@ import os
 import asyncio
 import aiosqlite
 from collections import defaultdict
-from logging_config import setup_logging, get_logger
-from db import (
+from feather_rank.logging_config import setup_logging, get_logger
+from feather_rank.db import (
     init_db, get_or_create_player, update_player, insert_match, top_players, recent_matches, DB_PATH,
     has_accepted_tos, set_tos_accepted, get_match, get_match_participant_ids, get_signatures, set_match_status, add_signature,
     insert_pending_match, list_pending_for_user
 )
-from mmr import apply_team_match
+from feather_rank.mmr import apply_team_match
 
 # Load environment variables and setup logging early
 load_dotenv()
 setup_logging()  # respects LOG_LEVEL env var; default INFO
 log = get_logger(__name__)
 TOKEN = os.getenv('DISCORD_TOKEN')
+TEST_MODE = os.getenv('TEST_MODE', '0') in ('1', 'true', 'TRUE', 'yes')
+TEST_GUILD_ID = os.getenv('TEST_GUILD_ID')
+TEST_GUILD_ID = int(TEST_GUILD_ID) if TEST_GUILD_ID and TEST_GUILD_ID.isdigit() else None
+EPHEMERAL_DB = os.getenv('EPHEMERAL_DB', '0') in ('1', 'true', 'TRUE', 'yes')
 
 # Configuration
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
-DATABASE_PATH = os.getenv("DATABASE_PATH", "./smashcord.sqlite")
+# When TEST_MODE is on, default to a separate DB unless explicitly overridden
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH",
+    "./test_feather_rank.sqlite" if TEST_MODE else "./smashcord.sqlite",
+)
+# Force in-memory DB if EPHEMERAL_DB is set
+if EPHEMERAL_DB:
+    DATABASE_PATH = "file::memory:?cache=shared"
 # Point-based match rules
 POINTS_TARGET = int(os.getenv("POINTS_TARGET", "21"))
 POINTS_WIN_BY = int(os.getenv("POINTS_WIN_BY", "2"))
@@ -56,12 +67,29 @@ TOS_TEXT = (
 async def on_ready():
     # Initialize database
     await init_db(DATABASE_PATH)
+    # Warn users if running with in-memory (non-persistent) database
+    if DATABASE_PATH.startswith("file::memory:") or DATABASE_PATH == ":memory:":
+        log.warning("Ephemeral DB mode active: data will NOT be saved between restarts")
     # Sync application commands
-    await tree.sync()
+    if TEST_MODE and TEST_GUILD_ID:
+        # Fast sync for a specific guild during testing
+        guild = discord.Object(id=TEST_GUILD_ID)
+        await tree.sync(guild=guild)
+        log.info("Commands synced to test guild %s only", TEST_GUILD_ID)
+    else:
+        await tree.sync()
+        log.info("Commands synced globally")
     # Set bot status to "Playing Badminton"
-    await bot.change_presence(activity=discord.Game(name="Badminton 🏸"))
-    log.info(f"Bot ready as %s (guilds=%s)", bot.user, len(bot.guilds))
-    log.debug("Commands synced and presence set")
+    status = "Badminton 🏸 [TEST MODE]" if TEST_MODE else "Badminton 🏸"
+    await bot.change_presence(activity=discord.Game(name=status))
+    log.info(
+        "Bot ready as %s (guilds=%s) | mode=%s | db=%s",
+        bot.user,
+        len(bot.guilds),
+        "TEST" if TEST_MODE else "PROD",
+        DATABASE_PATH,
+    )
+    log.debug("Presence set and startup complete")
 
 @tree.command(name="ping", description="Replies with pong")
 async def ping(interaction: discord.Interaction):
@@ -198,17 +226,21 @@ async def match_doubles_points(
         await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
         return
     guild_id = interaction.guild_id or 0
-    async with get_guild_lock(guild_id):
-        match_id = await insert_pending_match_points(
-            guild_id=guild_id,
-            mode="2v2",
-            team_a=[a1.id, a2.id],
-            team_b=[b1.id, b2.id],
-            set_scores=set_scores,
-            reporter=interaction.user.id
-        )
-    await notify_verification(match_id)
-    await interaction.followup.send(f"Match #{match_id} pending verification.", ephemeral=True)
+    try:
+        async with get_guild_lock(guild_id):
+            match_id = await insert_pending_match_points(
+                guild_id=guild_id,
+                mode="2v2",
+                team_a=[a1.id, a2.id],
+                team_b=[b1.id, b2.id],
+                set_scores=set_scores,
+                reporter=interaction.user.id
+            )
+        await notify_verification(match_id)
+        await interaction.followup.send(f"Match #{match_id} pending verification.", ephemeral=True)
+    except Exception as e:
+        log.exception("Failed to create match for user=%s", interaction.user.id)
+        await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
 
 # --- Singles match with points ---
 @tree.command(name="match_singles", description="Record a 1v1 badminton match (point-based)")
@@ -255,17 +287,21 @@ async def match_singles(
         await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
         return
     guild_id = interaction.guild_id or 0
-    async with get_guild_lock(guild_id):
-        match_id = await insert_pending_match_points(
-            guild_id=guild_id,
-            mode="1v1",
-            team_a=[a.id],
-            team_b=[b.id],
-            set_scores=set_scores,
-            reporter=interaction.user.id
-        )
-    await notify_verification(match_id)
-    await interaction.followup.send(f"Match #{match_id} pending verification.", ephemeral=True)
+    try:
+        async with get_guild_lock(guild_id):
+            match_id = await insert_pending_match_points(
+                guild_id=guild_id,
+                mode="1v1",
+                team_a=[a.id],
+                team_b=[b.id],
+                set_scores=set_scores,
+                reporter=interaction.user.id
+            )
+        await notify_verification(match_id)
+        await interaction.followup.send(f"Match #{match_id} pending verification.", ephemeral=True)
+    except Exception as e:
+        log.exception("Failed to create match for user=%s", interaction.user.id)
+        await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
 
 @tree.command(name="leaderboard", description="Show the top players by rating")
 @app_commands.describe(limit="Number of players to show (default: 20)")
@@ -477,8 +513,8 @@ async def pending(interaction: discord.Interaction):
 # --- Finalize match stub ---
 async def finalize_match(match_id: int):
     import json
-    from rules import match_winner
-    from mmr import team_points_update
+    from feather_rank.rules import match_winner
+    from feather_rank.mmr import team_points_update
     match = await get_match(match_id)
     if not match:
         log.error("Finalize failed: match not found id=%s", match_id)
@@ -513,7 +549,7 @@ async def finalize_match(match_id: int):
     for i, p in enumerate(players_b):
         await update_player(p['user_id'], new_ratings_b[i], won=(winner == 'B'))
     # Finalize match in DB
-    from db import finalize_points
+    from feather_rank.db import finalize_points
     await finalize_points(match_id, winner, set_scores, points_a, points_b)
     log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, points_a, points_b)
     # Build summary with per-set scores
@@ -574,5 +610,5 @@ if __name__ == "__main__":
     if not TOKEN:
         log.error("DISCORD_TOKEN not set. Please provide it via environment or .env file.")
         raise SystemExit(1)
-    log.info("Starting bot…")
+    log.info("Starting bot… (mode=%s)", "TEST" if TEST_MODE else "PROD")
     bot.run(TOKEN)

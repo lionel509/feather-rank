@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from dotenv import load_dotenv
 import os
-from logging_config import setup_logging, get_logger
+from feather_rank.logging_config import setup_logging, get_logger
 
 # Load environment variables and setup logging
 load_dotenv()
