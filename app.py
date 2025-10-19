@@ -189,16 +189,16 @@ async def match_doubles(
 # --- Doubles match with points ---
 @tree.command(name="match_doubles_points", description="Record a 2v2 badminton match (point-based)")
 @app_commands.describe(
-    a1="Team A - Player 1",
-    a2="Team A - Player 2",
-    b1="Team B - Player 1",
-    b2="Team B - Player 2",
-    s1a="Set 1: points for A",
-    s1b="Set 1: points for B",
-    s2a="Set 2: points for A",
-    s2b="Set 2: points for B",
-    s3a="Set 3: points for A (optional)",
-    s3b="Set 3: points for B (optional)"
+    Team1Player1="Team A - Player 1",
+    Team1Player2="Team A - Player 2",
+    Team2Player1="Team B - Player 1",
+    Team2Player2="Team B - Player 2",
+    Set1Team1Point="Set 1: points for A",
+    Set1Team2Point="Set 1: points for B",
+    Set2Team1Point="Set 2: points for A",
+    Set2Team2Point="Set 2: points for B",
+    Set3Team1Point="Set 3: points for A (optional)",
+    Set3Team2Point="Set 3: points for B (optional)"
 )
 async def match_doubles_points(
     interaction: discord.Interaction,
@@ -354,7 +354,7 @@ async def leaderboard(interaction: discord.Interaction, limit: int = 20):
         uid = int(uid_val) if uid_val is not None else 0
         stored_username = str(player.get('username', f'User{uid or "?"}'))
         name = await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=stored_username) if uid else stored_username
-        mention_str = fmt.mention(uid) if uid else stored_username
+        mention_str = f"@silent {fmt.mention(uid)}" if uid else stored_username
         wl = f"{player.get('wins', 0)}-{player.get('losses', 0)}"
         line = f"{idx}. {mention_str} — {name} — {player.get('rating', 0):.1f} ({wl})"
         lines.append(line)
@@ -378,7 +378,7 @@ async def stats(interaction: discord.Interaction, user: discord.User):
             player = dict(row) if row else None
 
     if not player:
-        await interaction.followup.send(f"📊 {user.mention} has no games recorded yet.")
+        await interaction.followup.send(f"📊 @silent {user.mention} has no games recorded yet.")
         return
 
     # Get player stats
@@ -582,24 +582,25 @@ async def pending(interaction: discord.Interaction):
         mode = match.get('mode', '')
         team_a_ids = [int(x) for x in match.get('team_a', '').split(',') if x]
         team_b_ids = [int(x) for x in match.get('team_b', '').split(',') if x]
-
         # Build team strings with mentions
-        a_mentions = [fmt.mention(uid) for uid in team_a_ids]
-        b_mentions = [fmt.mention(uid) for uid in team_b_ids]
+        a_mentions = [f"@silent {fmt.mention(uid)}" for uid in team_a_ids]
+        b_mentions = [f"@silent {fmt.mention(uid)}" for uid in team_b_ids]
         teams = f"{'/'.join(a_mentions)} vs {'/'.join(b_mentions)}"
-
         # Sets: parse set_scores and format using fmt.score_sets; fallback to N/A
         try:
             set_scores = json.loads(match.get('set_scores') or '[]')
         except Exception:
             set_scores = []
         sets_str = fmt.score_sets(set_scores) if set_scores else "N/A"
-
         rows.append([f"#{mid}", str(mode), teams, sets_str])
 
     table = fmt.mono_table(rows, headers=headers)
-    hint = "Run `/verify match_id:<ID> decision:approve name:Your Name`"
-    await interaction.followup.send(table + "\n" + hint, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
+    # Autofill name with user's display name or username
+    autofill_name = interaction.user.display_name if hasattr(interaction.user, 'display_name') and interaction.user.display_name else interaction.user.name
+    approve_box = fmt.block(f"/verify match_id:<ID> decision:approve name:{autofill_name}", "md")
+    reject_box = fmt.block(f"/verify match_id:<ID> decision:reject name:{autofill_name}", "md")
+    instructions = f"Approve:\n{approve_box}\nReject:\n{reject_box}"
+    await interaction.followup.send(table + "\n" + instructions, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
     log.debug("Listed %s pending matches for user=%s guild=%s", len(rows), user_id, guild_id)
 
 # --- Finalize match stub ---
@@ -732,7 +733,7 @@ async def notify_verification(match_id: int):
         except discord.Forbidden:
             # Fallback: post in a visible channel (system channel or any text channel) mentioning only this participant
             try:
-                post_text = f"{fmt.mention(user_id)}\n{base_msg.replace('match_id:<ID>', f'match_id:{match_id}')}"
+                post_text = f"@silent {fmt.mention(user_id)}\n{base_msg.replace('match_id:<ID>', f'match_id:{match_id}') }"
                 channel = None
                 if guild and getattr(guild, "system_channel", None):
                     channel = guild.system_channel
@@ -842,14 +843,36 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     except Exception:
         pass
 
+
     # Try to confirm back
     try:
         ch = await bot.fetch_channel(payload.channel_id)
         if isinstance(ch, (discord.TextChannel, discord.Thread, discord.DMChannel)):
             msg = await ch.fetch_message(payload.message_id)
             await msg.reply(f"Verification recorded as `{signed_name}` ({decision}).", mention_author=False)
+            # If approved, DM the user a confirmation
+            if decision == "approve":
+                try:
+                    user = await bot.fetch_user(payload.user_id)
+                    await user.send(f"✅ Thanks for verifying the match!")
+                except Exception:
+                    pass
+        else:
+            # If not a DM/TextChannel/Thread, still DM the user if approved
+            if decision == "approve":
+                try:
+                    user = await bot.fetch_user(payload.user_id)
+                    await user.send(f"✅ Thanks for verifying the match!")
+                except Exception:
+                    pass
     except Exception:
-        pass
+        # Fallback: DM user if approved
+        if decision == "approve":
+            try:
+                user = await bot.fetch_user(payload.user_id)
+                await user.send(f"✅ Thanks for verifying the match!")
+            except Exception:
+                pass
 
     # Check finalize
     try:
