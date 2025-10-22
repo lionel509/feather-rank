@@ -650,3 +650,240 @@ async def recent_matches(guild_id: int, user_id: Optional[int] = None, limit: in
         out = [dict(row) for row in rows]
         log.debug("Recent matches guild=%s user=%s limit=%s -> %s", guild_id, user_id, limit, len(out))
         return out
+
+
+# ========================================
+# Scoreboard Helper Functions
+# ========================================
+
+async def create_scoreboard(
+    guild_id: int,
+    mode: str,
+    target_points: int,
+    cap_points: int | None,
+    team_a_ids: list[int],
+    team_b_ids: list[int],
+    referee_id: int
+) -> int:
+    """Create a new scoreboard and return its ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        team_a_str = ",".join(map(str, team_a_ids))
+        team_b_str = ",".join(map(str, team_b_ids))
+        cursor = await db.execute(
+            """
+            INSERT INTO scoreboards (guild_id, mode, target_points, cap_points, team_a, team_b, referee_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (guild_id, mode, target_points, cap_points, team_a_str, team_b_str, referee_id)
+        )
+        await db.commit()
+        scoreboard_id = cursor.lastrowid if cursor.lastrowid is not None else -1
+    log.debug(
+        "Created scoreboard id=%s guild=%s mode=%s target=%s cap=%s referee=%s",
+        scoreboard_id, guild_id, mode, target_points, cap_points, referee_id
+    )
+    return scoreboard_id
+
+
+async def get_scoreboard_by_message(message_id: int) -> dict | None:
+    """Get scoreboard by message_id."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT s.* FROM scoreboards s
+            JOIN scoreboard_messages sm ON s.id = sm.scoreboard_id
+            WHERE sm.message_id = ?
+            """,
+            (message_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            result = dict(row) if row else None
+            log.debug("get_scoreboard_by_message message_id=%s -> %s", message_id, bool(result))
+            return result
+
+
+async def get_scoreboard(scoreboard_id: int) -> dict | None:
+    """Get scoreboard by ID."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM scoreboards WHERE id = ?",
+            (scoreboard_id,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            result = dict(row) if row else None
+            log.debug("get_scoreboard id=%s -> %s", scoreboard_id, bool(result))
+            return result
+
+
+async def get_set(scoreboard_id: int, set_no: int) -> dict | None:
+    """Get a specific set by scoreboard_id and set_no."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM scoreboard_sets WHERE scoreboard_id = ? AND set_no = ?",
+            (scoreboard_id, set_no)
+        ) as cursor:
+            row = await cursor.fetchone()
+            result = dict(row) if row else None
+            log.debug("get_set scoreboard=%s set=%s -> %s", scoreboard_id, set_no, bool(result))
+            return result
+
+
+async def upsert_set(
+    scoreboard_id: int,
+    set_no: int,
+    a: int,
+    b: int,
+    winner: str | None
+) -> None:
+    """Insert or update a set's score and winner."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO scoreboard_sets (scoreboard_id, set_no, a_points, b_points, winner)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(scoreboard_id, set_no) DO UPDATE SET
+                a_points = excluded.a_points,
+                b_points = excluded.b_points,
+                winner = excluded.winner
+            """,
+            (scoreboard_id, set_no, a, b, winner)
+        )
+        await db.commit()
+    log.debug(
+        "upsert_set scoreboard=%s set=%s a=%s b=%s winner=%s",
+        scoreboard_id, set_no, a, b, winner
+    )
+
+
+async def record_sb_message(message_id: int, scoreboard_id: int, set_no: int) -> None:
+    """Record a scoreboard message for reaction controls."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT OR REPLACE INTO scoreboard_messages (message_id, scoreboard_id, set_no)
+            VALUES (?, ?, ?)
+            """,
+            (message_id, scoreboard_id, set_no)
+        )
+        await db.commit()
+    log.debug("record_sb_message msg=%s scoreboard=%s set=%s", message_id, scoreboard_id, set_no)
+
+
+async def record_play(scoreboard_id: int, set_no: int, side: str, delta: int) -> None:
+    """Record a play (score change) for undo functionality."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO scoreboard_plays (scoreboard_id, set_no, side, delta)
+            VALUES (?, ?, ?, ?)
+            """,
+            (scoreboard_id, set_no, side, delta)
+        )
+        await db.commit()
+    log.debug("record_play scoreboard=%s set=%s side=%s delta=%s", scoreboard_id, set_no, side, delta)
+
+
+async def last_play(scoreboard_id: int, set_no: int) -> dict | None:
+    """Get the most recent play for a scoreboard set."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM scoreboard_plays
+            WHERE scoreboard_id = ? AND set_no = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (scoreboard_id, set_no)
+        ) as cursor:
+            row = await cursor.fetchone()
+            result = dict(row) if row else None
+            log.debug("last_play scoreboard=%s set=%s -> %s", scoreboard_id, set_no, bool(result))
+            return result
+
+
+async def delete_last_play(scoreboard_id: int, set_no: int) -> None:
+    """Delete the last play and decrement the corresponding team's score."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        # Get the last play
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """
+            SELECT * FROM scoreboard_plays
+            WHERE scoreboard_id = ? AND set_no = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (scoreboard_id, set_no)
+        ) as cursor:
+            row = await cursor.fetchone()
+            if not row:
+                log.debug("delete_last_play scoreboard=%s set=%s -> no play found", scoreboard_id, set_no)
+                return
+            
+            play = dict(row)
+            play_id = play['id']
+            side = play['side']
+            delta = play['delta']
+
+        # Delete the play
+        await db.execute("DELETE FROM scoreboard_plays WHERE id = ?", (play_id,))
+        
+        # Update the set scores by reversing the delta
+        if side == 'A':
+            await db.execute(
+                """
+                UPDATE scoreboard_sets
+                SET a_points = a_points - ?
+                WHERE scoreboard_id = ? AND set_no = ?
+                """,
+                (delta, scoreboard_id, set_no)
+            )
+        elif side == 'B':
+            await db.execute(
+                """
+                UPDATE scoreboard_sets
+                SET b_points = b_points - ?
+                WHERE scoreboard_id = ? AND set_no = ?
+                """,
+                (delta, scoreboard_id, set_no)
+            )
+        
+        await db.commit()
+    log.debug("delete_last_play scoreboard=%s set=%s side=%s delta=%s", scoreboard_id, set_no, side, delta)
+
+
+async def set_status(scoreboard_id: int, status: str) -> None:
+    """Set the status of a scoreboard."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE scoreboards SET status = ? WHERE id = ?",
+            (status, scoreboard_id)
+        )
+        await db.commit()
+    log.debug("set_status scoreboard=%s status=%s", scoreboard_id, status)
+
+
+async def set_serve_side(scoreboard_id: int, serve_side: str | None) -> None:
+    """Set the serve side indicator for a scoreboard."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE scoreboards SET serve_side = ? WHERE id = ?",
+            (serve_side, scoreboard_id)
+        )
+        await db.commit()
+    log.debug("set_serve_side scoreboard=%s serve_side=%s", scoreboard_id, serve_side)
+
+
+async def set_referee(scoreboard_id: int, referee_id: int) -> None:
+    """Set the referee for a scoreboard."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE scoreboards SET referee_id = ? WHERE id = ?",
+            (referee_id, scoreboard_id)
+        )
+        await db.commit()
+    log.debug("set_referee scoreboard=%s referee_id=%s", scoreboard_id, referee_id)

@@ -47,3 +47,41 @@ def match_winner(
             break
     winner = "A" if sets_a > sets_b else "B"
     return winner, sets_a, sets_b, pts_a, pts_b
+
+
+def set_finished(a: int, b: int, target: int, win_by: int = 2, cap: int | None = None) -> tuple[bool, str | None]:
+    """
+    Check if a set is finished and return the winner.
+    
+    Args:
+        a: Team A points
+        b: Team B points
+        target: Target points to reach (e.g., 21 or 11)
+        win_by: Minimum point difference to win (default: 2)
+        cap: Cap points (e.g., 30 or 15), auto-calculated if None
+    
+    Returns:
+        Tuple of (is_finished, winner)
+        - is_finished: True if the set is complete
+        - winner: 'A' or 'B' if finished, None if not finished
+    
+    Examples:
+        set_finished(21, 19, 21) -> (True, 'A')   # Won by 2
+        set_finished(21, 20, 21) -> (False, None)  # Need win by 2
+        set_finished(30, 29, 21) -> (True, 'A')   # Hit cap
+        set_finished(15, 10, 21) -> (False, None)  # Neither reached target
+    """
+    cap = cap or (30 if target >= 21 else 15)
+    m = max(a, b)
+    d = abs(a - b)
+    
+    # If neither team reached target, set is not finished
+    if m < target:
+        return (False, None)
+    
+    # If cap is reached, higher score wins immediately
+    if cap and m >= cap:
+        return (True, 'A' if a > b else 'B')
+    
+    # Otherwise, need to win by required margin
+    return (d >= win_by, 'A' if a > b else 'B' if d >= win_by else None)

@@ -15,7 +15,7 @@ from discord import app_commands
 # fmt must provide: bold, code, block, score_sets, display_name_or_cached, mention (optional)
 import fmt
 from feather_rank import db
-from feather_rank.rules import match_winner, valid_set
+from feather_rank.rules import match_winner, valid_set, set_finished
 from feather_rank.mmr import team_points_update
 
 # Optional logging util; fall back to std logging if missing
@@ -62,6 +62,14 @@ EMOJI_REJECT  = os.getenv("EMOJI_REJECT",  "❌")
 MENTIONS_PING = os.getenv("MENTIONS_PING", "1").lower() in ("1","true","yes")
 ALLOWED_MENTIONS = discord.AllowedMentions(users=MENTIONS_PING, roles=False, everyone=False)
 
+# Scoreboard emoji
+EMOJI_A_PLUS = os.getenv("EMOJI_A_PLUS", "🟥")   # add point Team A
+EMOJI_B_PLUS = os.getenv("EMOJI_B_PLUS", "🟦")   # add point Team B
+EMOJI_UNDO   = os.getenv("EMOJI_UNDO",   "↩️")   # undo last rally
+EMOJI_SERVE  = os.getenv("EMOJI_SERVE",  "🏸")   # toggle serve indicator (optional)
+EMOJI_NEXT   = os.getenv("EMOJI_NEXT",   "⏭️")   # force next set (admin/ref)
+EMOJI_DONE   = os.getenv("EMOJI_DONE",   "🏁")   # finalize early
+
 # Intents
 intents = discord.Intents.none()
 intents.guilds = True
@@ -104,6 +112,113 @@ async def require_tos(inter: discord.Interaction) -> bool:
         )
         return False
     return True
+
+async def _names(bot: discord.Client, guild: discord.Guild | None, ids: list[int]) -> str:
+    """Helper to format player names from user IDs."""
+    parts = []
+    for uid in ids:
+        parts.append(await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}"))
+    return "/".join(parts)
+
+def _serve_marker(serve_side: str | None) -> str:
+    """Helper to display serve indicator."""
+    return "▶ A" if serve_side == "A" else ("▶ B" if serve_side == "B" else "—")
+
+async def post_scoreboard_message(inter: discord.Interaction, scoreboard_id: int, set_no: int) -> discord.Message:
+    """Post a scoreboard message and add reaction controls."""
+    sb = await db.get_scoreboard(scoreboard_id)
+    s = await db.get_set(scoreboard_id, set_no)
+    guild = inter.guild
+
+    a_names = await _names(bot, guild, [int(x) for x in (sb["team_a"].split(",")) if x])
+    b_names = await _names(bot, guild, [int(x) for x in (sb["team_b"].split(",")) if x])
+
+    title = f"🏸 Live Scoreboard #{scoreboard_id} — Set {set_no}/{3}"
+    fmtline = f"Best-of-3 to {sb['target_points']} (win by 2, cap {sb['cap_points']})"
+    score = f"**A {s['a_points']} — {s['b_points']} B**"
+    serve = _serve_marker(sb.get("serve_side")) if "serve_side" in sb.keys() else "—"
+
+    content = (
+        f"{title}\n"
+        f"{a_names} **vs** {b_names}\n"
+        f"{fmtline}\n"
+        f"{score}   ·   Serve: {serve}\n\n"
+        f"React {EMOJI_A_PLUS} to add A point, {EMOJI_B_PLUS} for B, {EMOJI_UNDO} to undo.\n"
+        f"{EMOJI_DONE} finalize · {EMOJI_NEXT} next-set · {EMOJI_SERVE} toggle serve"
+    )
+
+    channel = inter.channel
+    m = await channel.send(content, allowed_mentions=ALLOWED_MENTIONS)
+    for e in (EMOJI_A_PLUS, EMOJI_B_PLUS, EMOJI_UNDO, EMOJI_SERVE, EMOJI_NEXT, EMOJI_DONE):
+        try:
+            await m.add_reaction(e)
+        except Exception:
+            pass
+    await db.record_sb_message(m.id, scoreboard_id, set_no)
+    return m
+
+async def edit_scoreboard_message(message: discord.Message, scoreboard_id: int, set_no: int) -> None:
+    """Edit an existing scoreboard message with updated scores."""
+    sb = await db.get_scoreboard(scoreboard_id)
+    s = await db.get_set(scoreboard_id, set_no)
+    guild = message.guild
+
+    a_names = await _names(bot, guild, [int(x) for x in (sb["team_a"].split(",")) if x])
+    b_names = await _names(bot, guild, [int(x) for x in (sb["team_b"].split(",")) if x])
+
+    title = f"🏸 Live Scoreboard #{scoreboard_id} — Set {set_no}/{3}"
+    fmtline = f"Best-of-3 to {sb['target_points']} (win by 2, cap {sb['cap_points']})"
+    score = f"**A {s['a_points']} — {s['b_points']} B**"
+    serve = _serve_marker(sb.get("serve_side")) if "serve_side" in sb.keys() else "—"
+
+    content = (
+        f"{title}\n"
+        f"{a_names} **vs** {b_names}\n"
+        f"{fmtline}\n"
+        f"{score}   ·   Serve: {serve}\n\n"
+        f"React {EMOJI_A_PLUS} to add A point, {EMOJI_B_PLUS} for B, {EMOJI_UNDO} to undo.\n"
+        f"{EMOJI_DONE} finalize · {EMOJI_NEXT} next-set · {EMOJI_SERVE} toggle serve"
+    )
+
+    await message.edit(content=content)
+
+async def finalize_scoreboard_match(scoreboard_id: int) -> None:
+    """Finalize a scoreboard match and create a verified match record."""
+    sb = await db.get_scoreboard(scoreboard_id)
+    if not sb:
+        log.warning("finalize_scoreboard_match: scoreboard not found id=%s", scoreboard_id)
+        return
+    
+    sets = [await db.get_set(scoreboard_id, i) for i in (1, 2, 3) if await db.get_set(scoreboard_id, i)]
+    if not sets:
+        log.warning("finalize_scoreboard_match: no sets found for scoreboard id=%s", scoreboard_id)
+        return
+    
+    # Build set_scores JSON for existing finalize_points path
+    set_scores = [{"A": int(s["a_points"]), "B": int(s["b_points"])} for s in sets if s]
+    
+    # Determine winner by sets
+    wa = sum(1 for s in sets if s.get("winner") == "A")
+    wb = sum(1 for s in sets if s.get("winner") == "B")
+    winner = "A" if wa > wb else "B"
+
+    # Insert pending match (or directly finalize if you want to skip verification for ref-controlled games)
+    match_id = await db.insert_pending_match_points(
+        guild_id=sb["guild_id"],
+        mode=sb["mode"],
+        team_a=[int(x) for x in sb["team_a"].split(",") if x],
+        team_b=[int(x) for x in sb["team_b"].split(",") if x],
+        set_scores=set_scores,
+        reporter=sb["referee_id"]
+    )
+    await db.set_status(scoreboard_id, "complete")
+    log.info("Finalized scoreboard match id=%s -> match_id=%s winner=%s", scoreboard_id, match_id, winner)
+
+    # Option A: send through existing verification flow
+    await notify_verification(match_id)
+
+    # Option B (if ref == verifier): directly call try_finalize_match(match_id)
+    # await try_finalize_match(match_id)
 
 # ---- Views: 6 dropdowns (A/B) for Set 1–3 ----
 # We keep the view here to avoid import cycles; you can move to views.py if you prefer.
@@ -181,6 +296,127 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
     if not bot.user or payload.user_id == bot.user.id:
         return
 
+    # SCOREBOARD BRANCH
+    sb_row = await db.get_scoreboard_by_message(payload.message_id)
+    if sb_row:
+        guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+        channel = await bot.fetch_channel(payload.channel_id)
+        msg = await channel.fetch_message(payload.message_id)
+        member = None
+        try:
+            member = payload.member or (guild and guild.get_member(payload.user_id))
+        except Exception:
+            pass
+
+        # Only referee (or admins) may press
+        sb = await db.get_scoreboard(sb_row["scoreboard_id"])
+        if payload.user_id != sb["referee_id"]:
+            # (optional) silently remove reaction for others
+            try:
+                await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+            except Exception:
+                pass
+            return
+
+        emoji = str(payload.emoji)
+
+        # Remove the pressed reaction (UX: one tap)
+        try:
+            await msg.remove_reaction(payload.emoji, member or discord.Object(id=payload.user_id))
+        except Exception:
+            pass
+
+        # Load set scores
+        s = await db.get_set(sb["id"], sb_row["set_no"])
+        a, b = int(s["a_points"]), int(s["b_points"])
+
+        changed = False
+        if emoji == EMOJI_A_PLUS:
+            a += 1
+            changed = True
+            await db.record_play(sb["id"], sb_row["set_no"], "A", +1)
+            await db.set_serve_side(sb["id"], "A")
+        elif emoji == EMOJI_B_PLUS:
+            b += 1
+            changed = True
+            await db.record_play(sb["id"], sb_row["set_no"], "B", +1)
+            await db.set_serve_side(sb["id"], "B")
+        elif emoji == EMOJI_UNDO:
+            lp = await db.last_play(sb["id"], sb_row["set_no"])
+            if lp:
+                if lp["side"] == "A":
+                    a = max(0, a - 1)
+                else:
+                    b = max(0, b - 1)
+                await db.delete_last_play(sb["id"], sb_row["set_no"])
+                changed = True
+        elif emoji == EMOJI_SERVE:
+            current_serve = sb.get("serve_side")
+            new_serve = "B" if current_serve == "A" else "A"
+            await db.set_serve_side(sb["id"], new_serve)
+        elif emoji == EMOJI_NEXT:
+            # force next set if current finished (or admin override)
+            pass
+        elif emoji == EMOJI_DONE:
+            # finalize early: mark complete using current sets
+            await finalize_scoreboard_match(sb["id"])
+            return
+
+        # Persist
+        if changed:
+            await db.upsert_set(sb["id"], sb_row["set_no"], a, b, None)
+
+        # Check set winner
+        finished, winner = set_finished(a, b, sb["target_points"], win_by=2, cap=sb["cap_points"])
+        if finished and winner:
+            await db.upsert_set(sb["id"], sb_row["set_no"], a, b, winner)
+
+            # Append "✅ Set {n} to {A/B}" to the current message
+            try:
+                current_content = msg.content
+                completion_text = f"\n\n✅ **Set {sb_row['set_no']} to Team {winner}**"
+                await msg.edit(content=current_content + completion_text)
+            except Exception as e:
+                log.warning("Failed to append set completion to message: %s", e)
+
+            # If set 1 done -> create set 2 message
+            # If set 2 leads to 1-1 -> create set 3 message
+            # Else if someone leads 2-0 -> finalize match
+            sets = [await db.get_set(sb["id"], i) for i in (1, 2, 3) if await db.get_set(sb["id"], i)]
+            wins_a = sum(1 for x in sets if x.get("winner") == "A")
+            wins_b = sum(1 for x in sets if x.get("winner") == "B")
+
+            if wins_a == 2 or wins_b == 2:
+                await finalize_scoreboard_match(sb["id"])
+                return
+
+            next_set_no = max(x["set_no"] for x in sets) + 1 if len(sets) < 3 else None
+            if next_set_no:
+                # Post next set message
+                await db.upsert_set(sb["id"], next_set_no, 0, 0, None)
+                # reuse author interaction is not available; fetch a channel context:
+                ch = await bot.fetch_channel(payload.channel_id)
+
+                class FakeInter:
+                    def __init__(self):
+                        self.guild = guild
+                        self.channel = ch
+
+                new_msg = await post_scoreboard_message(FakeInter(), sb["id"], next_set_no)
+                
+                # Pin the active set message (optional)
+                try:
+                    await new_msg.pin()
+                except Exception as e:
+                    log.debug("Failed to pin scoreboard message: %s", e)
+                
+                return
+
+        # Otherwise, just update the current message
+        await edit_scoreboard_message(msg, sb["id"], sb_row["set_no"])
+        return
+
+    # VERIFICATION BRANCH - fall through to existing verification reactions (✅/❌)
     row = await db.get_verification_message(payload.message_id)
     if not row:
         return
@@ -517,6 +753,97 @@ async def pending(inter: discord.Interaction):
     reject_box  = fmt.block(f"/verify match_id:<ID> decision:reject  name:{autofill}", "md")
     await inter.followup.send(table + "\nApprove:\n" + approve_box + "\nReject:\n" + reject_box,
                               ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
+
+# Scoreboard
+@tree.command(name="scoreboard", description="Start a live scoreboard controlled by reactions")
+@app_commands.describe(
+    mode="Singles or Doubles",
+    target="Target points (11 or 21)",
+    a="Player A (singles) or Team A - Player 1",
+    a2="Team A - Player 2 (doubles only)",
+    b="Player B (singles) or Team B - Player 1",
+    b2="Team B - Player 2 (doubles only)",
+    referee="Referee who can press reactions (defaults to you)"
+)
+@app_commands.choices(mode=[
+    app_commands.Choice(name="Singles (1v1)", value="1v1"),
+    app_commands.Choice(name="Doubles (2v2)", value="2v2"),
+])
+@app_commands.choices(target=[
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
+])
+async def scoreboard(
+    inter: discord.Interaction,
+    mode: str,
+    target: int,
+    a: discord.User,
+    b: discord.User,
+    a2: discord.User | None = None,
+    b2: discord.User | None = None,
+    referee: discord.User | None = None
+):
+    if mode == "2v2" and (not a2 or not b2):
+        return await inter.response.send_message("For doubles, please provide A2 and B2.", ephemeral=True)
+
+    ref = referee or inter.user
+    cap = 30 if target >= 21 else 15
+
+    team_a_ids = [a.id] + ([a2.id] if (mode == "2v2" and a2) else [])
+    team_b_ids = [b.id] + ([b2.id] if (mode == "2v2" and b2) else [])
+
+    sb_id = await db.create_scoreboard(inter.guild_id or 0, mode, target, cap, team_a_ids, team_b_ids, ref.id)
+    # ensure set 1 row exists
+    await db.upsert_set(sb_id, 1, 0, 0, None)
+
+    # Post Set 1 message and add reactions
+    msg = await post_scoreboard_message(inter, sb_id, set_no=1)  # implement in next step
+    await inter.response.send_message(f"Started scoreboard #{sb_id} (ref: {ref.mention}). See set message below.", ephemeral=True)
+
+# Scoreboard referee change
+@tree.command(name="scoreboard_referee", description="Change the referee for a live scoreboard")
+@app_commands.describe(
+    scoreboard_id="The ID of the scoreboard",
+    referee="The new referee who can control reactions"
+)
+async def scoreboard_referee(
+    inter: discord.Interaction,
+    scoreboard_id: int,
+    referee: discord.User
+):
+    sb = await db.get_scoreboard(scoreboard_id)
+    if not sb:
+        return await inter.response.send_message(
+            f"Scoreboard #{scoreboard_id} not found.",
+            ephemeral=True
+        )
+    
+    if sb["status"] != "live":
+        return await inter.response.send_message(
+            f"Scoreboard #{scoreboard_id} is not live (status: {sb['status']}).",
+            ephemeral=True
+        )
+    
+    # Only current referee or admins can change referee
+    is_admin = False
+    if inter.guild and isinstance(inter.user, discord.Member):
+        is_admin = inter.user.guild_permissions.administrator
+    
+    if inter.user.id != sb["referee_id"] and not is_admin:
+        return await inter.response.send_message(
+            "Only the current referee or server admins can change the referee.",
+            ephemeral=True
+        )
+    
+    # Update referee
+    await db.set_referee(scoreboard_id, referee.id)
+    
+    log.info("Changed scoreboard #%s referee from %s to %s", scoreboard_id, sb["referee_id"], referee.id)
+    await inter.response.send_message(
+        f"✅ Scoreboard #{scoreboard_id} referee changed to {referee.mention}.",
+        ephemeral=True,
+        allowed_mentions=ALLOWED_MENTIONS
+    )
 
 # --- Verification utilities ---
 async def notify_verification(match_id: int):
