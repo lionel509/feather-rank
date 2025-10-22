@@ -1,131 +1,83 @@
-# Debug: print number of player rows if leaderboard is empty
-async def print_player_row_count(conn):
-    cnt = await (await conn.execute("SELECT COUNT(*) c FROM players")).fetchone()
-    print("players rows:", cnt["c"])
-@tree.command(name="leaderboard", description="Show top players by rating")
-@app_commands.describe(limit="How many players to show (1-50)")
-async def leaderboard(inter: discord.Interaction, limit: app_commands.Range[int, 1, 50] = 20):
-    n = int(limit)  # do NOT coerce to 0; keep default 20
-    rows = await db.top_players(getattr(inter.guild, "id", None), n)
-    if not rows:
-        return await inter.response.send_message("No players found yet.", ephemeral=True)
+# app.py
+# Discord badminton bot — singles/doubles w/ point-share Elo, verification, dropdown scoring
 
-    # readable output using mentions + names
-    lines = [f"**🏆 Leaderboard (Top {n})**"]
-    for i, r in enumerate(rows, start=1):
-        uid, name, rating, w, l = r["user_id"], r["username"], r["rating"], r["wins"], r["losses"]
-        mention = f"<@{uid}>"
-        lines.append(f"{i}. {mention} — {name} — {rating:.1f} ({w}-{l})")
-    await inter.response.send_message("\n".join(lines), allowed_mentions=ALLOWED_MENTIONS)
-from views import PointsScoreView
-from rules import match_winner
+from __future__ import annotations
 
-@tree.command(name="match_singles", description="Report singles match (players, then select scores)")
-@app_commands.describe(a="Player A", b="Player B", target="Target points (11 or 21)")
-@app_commands.choices(target=[
-    app_commands.Choice(name="21", value=21),
-    app_commands.Choice(name="11", value=11),
-])
-async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.User, target: int = 21):
-    cap = 30 if target >= 21 else 15  # or your derive_cap()
-
-    async def on_submit(i2: discord.Interaction, set_scores: list[dict]):
-        try:
-            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
-        except Exception as e:
-            return await i2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
-
-        mid = await db.insert_pending_match_points(
-            guild_id=inter.guild.id, mode="singles",
-            team_a=[a.id], team_b=[b.id],
-            set_scores=set_scores, reporter=inter.user.id
-        )
-        await notify_verification(mid)
-        await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
-
-    view = PointsScoreView(target=target, cap=cap, on_submit=on_submit)
-    await inter.response.send_message(
-        content=f"Select set scores for {a.mention} vs {b.mention} (to {target}, win by 2).",
-        view=view, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS
-    )
-from feather_rank.rules import valid_set, match_winner
+import os
 import json
-import fmt
-from feather_rank.db import insert_pending_match_points
+import asyncio
+from collections import defaultdict
+import aiosqlite
 import discord
 from discord import app_commands
+
+# --- Internal modules (keep your package names) ---
+# fmt must provide: bold, code, block, score_sets, display_name_or_cached, mention (optional)
+import fmt
+from feather_rank import db
+from feather_rank.rules import match_winner, valid_set
+from feather_rank.mmr import team_points_update
+
+# Optional logging util; fall back to std logging if missing
+try:
+    from feather_rank.logging_config import setup_logging, get_logger  # type: ignore
+    setup_logging()
+    log = get_logger(__name__)
+except Exception:  # pragma: no cover
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    log = logging.getLogger("feather_rank.app")
+
+# --- Env / Config ---
 from dotenv import load_dotenv
-import os
-import asyncio
-import aiosqlite
-from collections import defaultdict
-from feather_rank.logging_config import setup_logging, get_logger
-from feather_rank.db import (
-    get_or_create_player, update_player, insert_match, top_players, recent_matches,
-    get_match, get_match_participant_ids, get_signatures, set_match_status, add_signature,
-    insert_pending_match, list_pending_for_user, latest_pending_for_user
-)
-from feather_rank.mmr import apply_team_match
-from feather_rank import db as db
-
-# Load environment variables and setup logging early
 load_dotenv()
-setup_logging()  # respects LOG_LEVEL env var; default INFO
-log = get_logger(__name__)
-TOKEN = os.getenv('DISCORD_TOKEN')
-TEST_MODE = os.getenv('TEST_MODE', '0') in ('1', 'true', 'TRUE', 'yes')
-TEST_GUILD_ID = os.getenv('TEST_GUILD_ID')
-TEST_GUILD_ID = int(TEST_GUILD_ID) if TEST_GUILD_ID and TEST_GUILD_ID.isdigit() else None
-EPHEMERAL_DB = os.getenv('EPHEMERAL_DB', '0') in ('1', 'true', 'TRUE', 'yes')
 
-# --- Discord config and intents ---
-EMOJI_APPROVE = os.getenv("EMOJI_APPROVE", "✅")
-EMOJI_REJECT  = os.getenv("EMOJI_REJECT",  "❌")
-MENTIONS_PING = os.getenv("MENTIONS_PING","1").lower() in ("1","true","yes")
-ALLOWED_MENTIONS = discord.AllowedMentions(users=MENTIONS_PING, roles=False, everyone=False)
+TOKEN = os.getenv("DISCORD_TOKEN")
+TEST_MODE = os.getenv("TEST_MODE", "0").lower() in ("1", "true", "yes")
+TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0") or 0) or None
+EPHEMERAL_DB = os.getenv("EPHEMERAL_DB", "0").lower() in ("1", "true", "yes")
 
-intents = discord.Intents.default()
-intents.reactions = True
-# use these intents when constructing Bot(...)
-
-# Configuration
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
-# When TEST_MODE is on, default to a separate DB unless explicitly overridden
+
 DATABASE_PATH = os.getenv(
     "DATABASE_PATH",
     "./test_feather_rank.sqlite" if TEST_MODE else "./smashcord.sqlite",
 )
-# Force in-memory DB if EPHEMERAL_DB is set
 if EPHEMERAL_DB:
     DATABASE_PATH = "file::memory:?cache=shared"
-# Point-based match rules
+
+# Scoring knobs
 POINTS_TARGET_DEFAULT = int(os.getenv("POINTS_TARGET_DEFAULT", "21"))
 POINTS_WIN_BY = int(os.getenv("POINTS_WIN_BY", "2"))
-# If POINTS_CAP is unset, derive: 30 for 21-point games; 15 for 11-point games.
-POINTS_CAP_ENV = os.getenv("POINTS_CAP")
+POINTS_CAP_ENV = os.getenv("POINTS_CAP")  # if set, overrides derived cap
 
 def derive_cap(target: int) -> int | None:
     if POINTS_CAP_ENV is not None:
         return int(POINTS_CAP_ENV)
     return 30 if target >= 21 else 15
 
-# Guild-based locks for database writes
-guild_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+# Emoji + mentions
+EMOJI_APPROVE = os.getenv("EMOJI_APPROVE", "✅")
+EMOJI_REJECT  = os.getenv("EMOJI_REJECT",  "❌")
+MENTIONS_PING = os.getenv("MENTIONS_PING", "1").lower() in ("1","true","yes")
+ALLOWED_MENTIONS = discord.AllowedMentions(users=MENTIONS_PING, roles=False, everyone=False)
 
-def get_guild_lock(guild_id: int | None) -> asyncio.Lock:
-    """Get or create a lock for the specified guild."""
-    return guild_locks[guild_id or 0]
-
-# Setup minimal intents (no privileged intents needed)
+# Intents
 intents = discord.Intents.none()
-intents.guilds = True  # Required for guild commands
-intents.reactions = True  # Needed for on_raw_reaction_add
+intents.guilds = True
+intents.reactions = True   # for on_raw_reaction_add
+intents.members = False    # not required for slash commands
 
-# Create bot instance
+# Discord client + tree
 bot = discord.Client(intents=intents)
 tree = app_commands.CommandTree(bot)
 
-# Terms of Service text
+# Guild locks
+guild_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+def get_guild_lock(guild_id: int | None) -> asyncio.Lock:
+    return guild_locks[guild_id or 0]
+
+# ToS text
 TOS_TEXT = (
     "By using this bot you agree to fair-play. "
     "False reports may be rejected or reverted. "
@@ -133,8 +85,9 @@ TOS_TEXT = (
     "Type /agree_tos to continue."
 )
 
-# Defensive wrapper around ToS acceptance check
+# --- Helpers ---
 async def has_accepted_tos_safe(user_id: int) -> bool:
+    """Check ToS acceptance; if table missing, create schema and retry."""
     try:
         return await db.has_accepted_tos(user_id)
     except aiosqlite.OperationalError as e:
@@ -143,62 +96,142 @@ async def has_accepted_tos_safe(user_id: int) -> bool:
             return await db.has_accepted_tos(user_id)
         raise
 
-@bot.event
-async def on_ready():
-    # Initialize database (use shim to ensure correct module's DB_PATH is set)
-    await db.init_db(DATABASE_PATH)
-    # Warn users if running with in-memory (non-persistent) database
-    if DATABASE_PATH.startswith("file::memory:") or DATABASE_PATH == ":memory:":
-        log.warning("Ephemeral DB mode active: data will NOT be saved between restarts")
-    # Sync application commands
-    if TEST_MODE and TEST_GUILD_ID:
-        # Fast sync for a specific guild during testing
-        guild = discord.Object(id=TEST_GUILD_ID)
-        await tree.sync(guild=guild)
-        log.info("Commands synced to test guild %s only", TEST_GUILD_ID)
-    else:
-        # Ensure DB init awaited before syncing commands
-        await db.init_db(DATABASE_PATH)
-        await tree.sync()
-        log.info("Commands synced globally")
-    # Set bot status to "Playing Badminton"
-    status = "Badminton 🏸 [TEST MODE]" if TEST_MODE else "Badminton 🏸"
-    await bot.change_presence(activity=discord.Game(name=status))
-    log.info(
-        "Bot ready as %s (guilds=%s) | mode=%s | db=%s",
-        bot.user,
-        len(bot.guilds),
-        "TEST" if TEST_MODE else "PROD",
-        DATABASE_PATH,
-    )
-    log.debug("Presence set and startup complete")
-    
-    # Periodically ensure DB schema exists (idempotent) — best-effort
-    async def _db_ensure_tables_periodic():
-        while True:
-            try:
-                await db.init_db(DATABASE_PATH)
-            except Exception:
-                log.debug("Periodic DB schema ensure failed", exc_info=True)
-            await asyncio.sleep(600)
-    try:
-        asyncio.create_task(_db_ensure_tables_periodic())
-    except Exception:
-        pass
-
-@tree.command(name="ping", description="Replies with pong")
-async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("pong")
-
-# --- ToS Agreement Helper ---
-async def require_tos(interaction: discord.Interaction) -> bool:
-    if not await has_accepted_tos_safe(interaction.user.id):
-        await interaction.response.send_message(
+async def require_tos(inter: discord.Interaction) -> bool:
+    if not await has_accepted_tos_safe(inter.user.id):
+        await inter.response.send_message(
             "❗ Please run /agree_tos first to accept the Terms of Service.",
             ephemeral=True
         )
         return False
     return True
+
+# ---- Views: 6 dropdowns (A/B) for Set 1–3 ----
+# We keep the view here to avoid import cycles; you can move to views.py if you prefer.
+def _point_options(target: int, cap: int | None) -> list[discord.SelectOption]:
+    hi = cap or (30 if target >= 21 else 15)
+    return [discord.SelectOption(label=str(i), value=str(i)) for i in range(0, hi + 1)]
+
+class _PointsSelect(discord.ui.Select):
+    def __init__(self, set_idx: int, side: str, target: int, cap: int | None):
+        self.set_idx, self.side = set_idx, side
+        opts = _point_options(target, cap)
+        ph = f"Set {set_idx} — {'A' if side=='A' else 'B'} points"
+        super().__init__(placeholder=ph, min_values=1, max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.choices.setdefault(self.set_idx, {"A": None, "B": None})
+        self.view.choices[self.set_idx][self.side] = int(self.values[0])
+        await interaction.response.defer()
+
+class PointsScoreView(discord.ui.View):
+    """6 dropdowns: S1A, S1B, S2A, S2B, S3A, S3B"""
+    def __init__(self, target: int, cap: int | None, on_submit):
+        super().__init__(timeout=180)
+        self.target, self.cap, self.on_submit = target, cap, on_submit
+        self.choices: dict[int, dict[str, int | None]] = {}
+        for s in (1, 2, 3):
+            self.add_item(_PointsSelect(s, "A", target, cap))
+            self.add_item(_PointsSelect(s, "B", target, cap))
+
+    def _min_two_sets_filled(self) -> bool:
+        done = 0
+        for s in (1, 2, 3):
+            v = self.choices.get(s)
+            if v and v.get("A") is not None and v.get("B") is not None:
+                done += 1
+        return done >= 2
+
+    @discord.ui.button(label="Submit", style=discord.ButtonStyle.success)
+    async def submit(self, _button, interaction: discord.Interaction):
+        if not self._min_two_sets_filled():
+            return await interaction.response.send_message(
+                "Please select scores for at least **two** sets.",
+                ephemeral=True
+            )
+        set_scores: list[dict] = []
+        for i in (1, 2, 3):
+            v = self.choices.get(i)
+            if v and v.get("A") is not None and v.get("B") is not None:
+                set_scores.append({"A": int(v["A"]), "B": int(v["B"])})
+        await self.on_submit(interaction, set_scores)
+
+# --- Discord events ---
+@bot.event
+async def on_ready():
+    await db.init_db(DATABASE_PATH)
+
+    if DATABASE_PATH.startswith("file::memory:") or DATABASE_PATH == ":memory:":
+        log.warning("Ephemeral DB mode active: data will NOT persist between restarts")
+
+    # Sync commands
+    if TEST_MODE and TEST_GUILD_ID:
+        await tree.sync(guild=discord.Object(id=TEST_GUILD_ID))
+        log.info("Commands synced to test guild %s", TEST_GUILD_ID)
+    else:
+        await tree.sync()
+        log.info("Commands synced globally")
+
+    status = "Badminton 🏸 [TEST MODE]" if TEST_MODE else "Badminton 🏸"
+    await bot.change_presence(activity=discord.Game(name=status))
+    log.info("Bot ready as %s | guilds=%s | DB=%s", bot.user, len(bot.guilds), DATABASE_PATH)
+
+# Reaction-based verification
+@bot.event
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
+    if not bot.user or payload.user_id == bot.user.id:
+        return
+
+    row = await db.get_verification_message(payload.message_id)
+    if not row:
+        return
+    if payload.user_id != row["user_id"]:
+        return
+
+    emoji = str(payload.emoji)
+    if   emoji == EMOJI_APPROVE: decision = "approve"
+    elif emoji == EMOJI_REJECT:  decision = "reject"
+    else: return
+
+    if not await has_accepted_tos_safe(payload.user_id):
+        ch = await bot.fetch_channel(payload.channel_id)
+        try:
+            msg = await ch.fetch_message(payload.message_id)
+            await msg.reply(
+                "Please run `/agree_tos name:<Your Name>` first, then react again.",
+                mention_author=False,
+                allowed_mentions=ALLOWED_MENTIONS
+            )
+        except Exception:
+            pass
+        return
+
+    tos = await db.get_tos(payload.user_id)
+    signed_name = (tos["signed_name"] if tos and tos.get("signed_name") else None)
+    if not signed_name:
+        guild = bot.get_guild(row["guild_id"]) if row["guild_id"] else None
+        member = guild.get_member(payload.user_id) if guild else None
+        signed_name = (member.display_name if member else "Unknown")[:60]
+
+    await db.add_signature(row["match_id"], payload.user_id, decision, signed_name)
+    await db.delete_verification_message(payload.message_id)
+
+    try:
+        ch = await bot.fetch_channel(payload.channel_id)
+        msg = await ch.fetch_message(payload.message_id)
+        await msg.reply(
+            f"Verification recorded as `{signed_name}` ({decision}).",
+            mention_author=False,
+            allowed_mentions=ALLOWED_MENTIONS
+        )
+    except Exception:
+        pass
+
+    await try_finalize_match(row["match_id"])
+
+# --- Commands ---
+@tree.command(name="ping", description="Replies with pong")
+async def ping(inter: discord.Interaction):
+    await inter.response.send_message("pong")
 
 @tree.command(name="agree_tos", description="Agree to the Terms and record your name")
 @app_commands.describe(name="Your name as you want it recorded")
@@ -208,332 +241,44 @@ async def agree_tos(inter: discord.Interaction, name: str):
         f"**ToS accepted.** Recorded name: `{(name or '').strip()[:60]}`",
         ephemeral=True
     )
-    log.info("User %s accepted ToS with name", inter.user.id)
 
-@tree.command(name="match_doubles", description="Record a 2v2 badminton match (pick players, then select scores)")
-@app_commands.describe(
-    a1="Team A - Player 1",
-    a2="Team A - Player 2",
-    b1="Team B - Player 1",
-    b2="Team B - Player 2",
-    target="Target points (11 or 21)"
-)
-@app_commands.choices(target=[
-    app_commands.Choice(name="21", value=21),
-    app_commands.Choice(name="11", value=11),
-])
-async def match_doubles(
-    inter: discord.Interaction,
-    a1: discord.User,
-    a2: discord.User,
-    b1: discord.User,
-    b2: discord.User,
-    target: int = 21
-):
-    from views import ScoreSelectView
-    
-    if not await require_tos(inter):
-        return
-    
-    all_players = [a1.id, a2.id, b1.id, b2.id]
-    if len(set(all_players)) != 4:
-        await inter.response.send_message("❌ All four players must be different.", ephemeral=True)
-        return
-    
-    cap = 30 if target >= 21 else 15
+# Leaderboard (fixed limit handling)
+@tree.command(name="leaderboard", description="Show top players by rating")
+@app_commands.describe(limit="How many players to show (1-50)")
+async def leaderboard(inter: discord.Interaction, limit: app_commands.Range[int, 1, 50] = 20):
+    n = int(limit)
+    rows = await db.top_players(getattr(inter.guild, "id", None), n)
+    if not rows:
+        return await inter.response.send_message("No players found yet.", ephemeral=True)
 
-    async def on_submit(inter2: discord.Interaction, set_scores: list[dict]):
-        # Validate & finish
-        from feather_rank.rules import match_winner
-        try:
-            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
-        except Exception as e:
-            return await inter2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
+    lines = [f"**🏆 Leaderboard (Top {n})**"]
+    for i, r in enumerate(rows, start=1):
+        uid, name, rating, w, l = r["user_id"], r["username"], r["rating"], r["wins"], r["losses"]
+        mention = f"<@{uid}>"
+        lines.append(f"{i}. {mention} — {name} — {rating:.1f} ({w}-{l})")
+    await inter.response.send_message("\n".join(lines), allowed_mentions=ALLOWED_MENTIONS)
 
-        # persist as PENDING + verification
-        match_id = await db.insert_pending_match_points(
-            guild_id=inter.guild_id or 0,
-            mode="2v2",
-            team_a=[a1.id, a2.id],
-            team_b=[b1.id, b2.id],
-            set_scores=set_scores,
-            reporter=inter.user.id,
-            target_points=target
-        )
-        await notify_verification(match_id)
-        await inter2.response.edit_message(content=f"Match #{match_id} created. Waiting for approvals.", view=None)
-
-    view = ScoreSelectView(target=target, cap=cap, on_submit=on_submit)
-    
-    def disp(u: discord.User) -> str:
-        return getattr(u, 'display_name', None) or u.name
-    
-    await inter.response.send_message(
-        content=f"Select set scores for {disp(a1)}/{disp(a2)} vs {disp(b1)}/{disp(b2)} (to {target}, win by 2).",
-        view=view,
-        ephemeral=True,
-        allowed_mentions=ALLOWED_MENTIONS
-    )
-
-# --- Doubles match with points ---
-@tree.command(name="match_doubles_points", description="Record a 2v2 badminton match (point-based)")
-@app_commands.describe(
-    a1="Team A - Player 1",
-    a2="Team A - Player 2",
-    b1="Team B - Player 1",
-    b2="Team B - Player 2",
-    s1a="Set 1: points for A",
-    s1b="Set 1: points for B",
-    s2a="Set 2: points for A",
-    s2b="Set 2: points for B",
-    s3a="Set 3: points for A (optional)",
-    s3b="Set 3: points for B (optional)",
-    target="Target points per set (default: 21)"
-)
-@app_commands.choices(target=[
-    app_commands.Choice(name="11 points", value=11),
-    app_commands.Choice(name="21 points", value=21)
-])
-async def match_doubles_points(
-    interaction: discord.Interaction,
-    a1: discord.User,
-    a2: discord.User,
-    b1: discord.User,
-    b2: discord.User,
-    s1a: int,
-    s1b: int,
-    s2a: int,
-    s2b: int,
-    s3a: int | None = None,
-    s3b: int | None = None,
-    target: int = POINTS_TARGET_DEFAULT
-):
-    if not await require_tos(interaction):
-        return
-    await interaction.response.defer(ephemeral=True)
-    all_players = [a1.id, a2.id, b1.id, b2.id]
-    if len(set(all_players)) != 4:
-        await interaction.followup.send("❌ All four players must be different.", ephemeral=True)
-        return
-    # Build set_scores from s1*, s2*, s3*
-    set_scores = [
-        {"A": s1a, "B": s1b},
-        {"A": s2a, "B": s2b}
-    ]
-    if s3a is not None and s3b is not None:
-        set_scores.append({"A": s3a, "B": s3b})
-    # Validate each set
-    cap = derive_cap(target)
-    for i, s in enumerate(set_scores):
-        if not valid_set(s["A"], s["B"], target, POINTS_WIN_BY, cap):
-            await interaction.followup.send(f"❌ Set {i+1} is not valid.", ephemeral=True)
-            return
-    # Compute winner and points
-    winner, sets_a, sets_b, pts_a, pts_b = match_winner(set_scores, target, POINTS_WIN_BY, cap)
-    if not winner:
-        await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
-        return
-    guild_id = interaction.guild_id or 0
-    try:
-        async with get_guild_lock(guild_id):
-            match_id = await insert_pending_match_points(
-                guild_id=guild_id,
-                mode="2v2",
-                team_a=[a1.id, a2.id],
-                team_b=[b1.id, b2.id],
-                set_scores=set_scores,
-                reporter=interaction.user.id,
-                target_points=target
-            )
-        await notify_verification(match_id)
-        # Build compact summary
-        def disp(u: discord.User) -> str:
-            return getattr(u, 'display_name', None) or u.name
-        title = fmt.bold(f"Match #{match_id} — Pending Verification")
-        teams = f"{disp(a1)}/{disp(a2)} vs {disp(b1)}/{disp(b2)}"
-        format_line = f"Best-of-3 to {target} (win by {POINTS_WIN_BY})"
-        sets_line = fmt.score_sets(set_scores)
-        help_line = "Use " + fmt.code("/verify") + " to approve or " + fmt.code('/verify decision:reject') + " to reject."
-        msg = f"{title}\n{teams}\n{format_line}\n{sets_line}\n{help_line}"
-        await interaction.followup.send(msg, ephemeral=True)
-    except Exception as e:
-        log.exception("Failed to create match for user=%s", interaction.user.id)
-        await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
-
-# --- Singles match with dropdown score selection ---
-@tree.command(name="match_singles", description="Report a singles match (pick players, then select scores)")
-@app_commands.describe(a="Player A", b="Player B", target="Target points (11 or 21)")
-@app_commands.choices(target=[
-    app_commands.Choice(name="21", value=21),
-    app_commands.Choice(name="11", value=11),
-])
-async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.User, target: int = 21):
-    from views import ScoreSelectView
-    
-    if not await require_tos(inter):
-        return
-    
-    cap = 30 if target >= 21 else 15  # override with your derive_cap() if you have it
-
-    async def on_submit(inter2: discord.Interaction, set_scores: list[dict]):
-        # Validate & finish (reuse your rules + pending + notify)
-        from feather_rank.rules import match_winner
-        try:
-            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
-        except Exception as e:
-            return await inter2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
-
-        # persist as PENDING + verification
-        match_id = await db.insert_pending_match_points(
-            guild_id=inter.guild_id or 0,
-            mode="singles",
-            team_a=[a.id],
-            team_b=[b.id],
-            set_scores=set_scores,
-            reporter=inter.user.id,
-            target_points=target
-        )
-        await notify_verification(match_id)  # your existing function
-        await inter2.response.edit_message(content=f"Match #{match_id} created. Waiting for approvals.", view=None)
-
-    view = ScoreSelectView(target=target, cap=cap, on_submit=on_submit)
-    await inter.response.send_message(
-        content=f"Select set scores for {a.mention} vs {b.mention} (to {target}, win by 2).",
-        view=view,
-        ephemeral=True,
-        allowed_mentions=ALLOWED_MENTIONS
-    )
-
-@tree.command(name="leaderboard", description="Show the top players by rating")
-@app_commands.describe(limit="Number of players to show (default: 20)")
-async def leaderboard(interaction: discord.Interaction, limit: int = 20):
-    # Validate limit
-    if limit < 1:
-        await interaction.response.send_message("❌ Limit must be at least 1")
-        return
-    if limit > 100:
-        await interaction.response.send_message("❌ Limit cannot exceed 100")
-        return
-
-    # Get top players
-    players = await top_players(guild_id=interaction.guild_id or 0, limit=limit)
-
-    if not players:
-        await interaction.response.send_message("📊 No players found. Play some matches to get started!")
-        return
-
-    title = f"🏆 Leaderboard (Top {limit})"
-    lines: list[str] = []
-    for idx, player in enumerate(players, start=1):
-        uid_val = player.get('user_id')
-        uid = int(uid_val) if uid_val is not None else 0
-        stored_username = str(player.get('username', f'User{uid or "?"}'))
-        name = await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=stored_username) if uid else stored_username
-        wl = f"{player.get('wins', 0)}-{player.get('losses', 0)}"
-        line = f"{idx}. {name} — {player.get('rating', 0):.1f} ({wl})"
-        lines.append(line)
-
-    content = "**" + title + "**\n" + "\n".join(lines)
-    await interaction.response.send_message(content=content, allowed_mentions=ALLOWED_MENTIONS)
-    log.debug("Sent leaderboard for guild=%s, limit=%s", interaction.guild_id, limit)
-
-@tree.command(name="test", description="Run validation tests for scoring rules")
-async def test_command(interaction: discord.Interaction):
-    """Test scoring validation with various scenarios."""
-    from feather_rank.rules import valid_set, match_winner
-    
-    results = []
-    
-    # Test cases for target=11
-    results.append("**Tests for target=11 (cap=15):**")
-    
-    # Test 1: (11,13) - B wins with 2-point margin
-    test1_valid = valid_set(11, 13, target=11, win_by=2, cap=15)
-    results.append(f"✓ (11,13): valid={test1_valid}, expected=True {'✅' if test1_valid else '❌'}")
-    if test1_valid:
-        try:
-            winner1, _, _, _, _ = match_winner([{"A": 11, "B": 13}], target=11, win_by=2, cap=15)
-            results.append(f"  Winner: {winner1}, expected=B {'✅' if winner1 == 'B' else '❌'}")
-        except Exception as e:
-            results.append(f"  Error getting winner: {e} ❌")
-    
-    # Test 2: (13,11) - A wins with 2-point margin
-    test2_valid = valid_set(13, 11, target=11, win_by=2, cap=15)
-    results.append(f"✓ (13,11): valid={test2_valid}, expected=True {'✅' if test2_valid else '❌'}")
-    if test2_valid:
-        try:
-            winner2, _, _, _, _ = match_winner([{"A": 13, "B": 11}], target=11, win_by=2, cap=15)
-            results.append(f"  Winner: {winner2}, expected=A {'✅' if winner2 == 'A' else '❌'}")
-        except Exception as e:
-            results.append(f"  Error getting winner: {e} ❌")
-    
-    # Test 3: (11,10) - Invalid, no 2-point margin
-    test3_valid = valid_set(11, 10, target=11, win_by=2, cap=15)
-    results.append(f"✓ (11,10): valid={test3_valid}, expected=False {'✅' if not test3_valid else '❌'}")
-    
-    # Test 4: (15,14) - Valid at cap (next point wins)
-    test4_valid = valid_set(15, 14, target=11, win_by=2, cap=15)
-    results.append(f"✓ (15,14): valid={test4_valid}, expected=True (at cap) {'✅' if test4_valid else '❌'}")
-    if test4_valid:
-        try:
-            winner4, _, _, _, _ = match_winner([{"A": 15, "B": 14}], target=11, win_by=2, cap=15)
-            results.append(f"  Winner: {winner4}, expected=A {'✅' if winner4 == 'A' else '❌'}")
-        except Exception as e:
-            results.append(f"  Error getting winner: {e} ❌")
-    
-    # Test 5: (14,15) - Valid at cap, B wins
-    test5_valid = valid_set(14, 15, target=11, win_by=2, cap=15)
-    results.append(f"✓ (14,15): valid={test5_valid}, expected=True (at cap) {'✅' if test5_valid else '❌'}")
-    
-    # Additional tests for target=21
-    results.append("\n**Tests for target=21 (cap=30):**")
-    
-    # Test 6: (21,19) - Valid with 2-point margin
-    test6_valid = valid_set(21, 19, target=21, win_by=2, cap=30)
-    results.append(f"✓ (21,19): valid={test6_valid}, expected=True {'✅' if test6_valid else '❌'}")
-    
-    # Test 7: (30,29) - Valid at cap
-    test7_valid = valid_set(30, 29, target=21, win_by=2, cap=30)
-    results.append(f"✓ (30,29): valid={test7_valid}, expected=True (at cap) {'✅' if test7_valid else '❌'}")
-    
-    # Test 8: (21,20) - Invalid, no 2-point margin
-    test8_valid = valid_set(21, 20, target=21, win_by=2, cap=30)
-    results.append(f"✓ (21,20): valid={test8_valid}, expected=False {'✅' if not test8_valid else '❌'}")
-    
-    summary = "\n".join(results)
-    await interaction.response.send_message(f"**Scoring Rules Validation Tests:**\n\n{summary}", ephemeral=True)
-
+# Stats
 @tree.command(name="stats", description="Show player statistics")
 @app_commands.describe(user="The user to show stats for")
-async def stats(interaction: discord.Interaction, user: discord.User):
-    await interaction.response.defer()
+async def stats(inter: discord.Interaction, user: discord.User):
+    await inter.response.defer(ephemeral=True)
 
-    # Try to get existing player (don't create)
-    async with aiosqlite.connect(db.DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        async with db.execute(
-            "SELECT * FROM players WHERE user_id = ?", (user.id,)
-        ) as cursor:
-            row = await cursor.fetchone()
+    async with aiosqlite.connect(db.DB_PATH) as _conn:
+        _conn.row_factory = aiosqlite.Row
+        async with _conn.execute("SELECT * FROM players WHERE user_id = ?", (user.id,)) as cur:
+            row = await cur.fetchone()
             player = dict(row) if row else None
 
     if not player:
-        user_display = user.display_name if hasattr(user, 'display_name') and user.display_name else user.name
-        await interaction.followup.send(f"📊 {user_display} has no games recorded yet.")
-        return
+        display = user.display_name if getattr(user, "display_name", None) else user.name
+        return await inter.followup.send(f"📊 {display} has no games recorded yet.", ephemeral=True)
 
-    # Get player stats
-    total_matches = player['wins'] + player['losses']
-    win_rate = (player['wins'] / total_matches * 100) if total_matches > 0 else 0
+    total_matches = player["wins"] + player["losses"]
+    win_rate = (player["wins"] / total_matches * 100) if total_matches > 0 else 0
 
-    # Get recent matches
-    matches = await recent_matches(
-        guild_id=interaction.guild_id or 0, 
-        user_id=user.id, 
-        limit=5
-    )
+    matches = await db.recent_matches(guild_id=inter.guild_id or 0, user_id=user.id, limit=5)
 
-    # Build KV section with bold keys and inline code numbers
     rating_str = f"{player['rating']:.1f}"
     wl_str = f"{player['wins']}-{player['losses']}"
     win_rate_str = f"{win_rate:.1f}%"
@@ -543,50 +288,127 @@ async def stats(interaction: discord.Interaction, user: discord.User):
         f"{fmt.bold('Total Matches')}: {fmt.code(str(total_matches))}",
     ]
 
-    # Recent matches table (short columns)
     recent_block = ""
     if matches:
         headers = ["Mode", "Team", "Sets", "Result"]
-        rows: list[list[str]] = []
-        for match in matches:
-            mode = str(match.get('mode', ''))
-            team_a_ids = [int(x) for x in match.get('team_a', '').split(',') if x]
-            team_b_ids = [int(x) for x in match.get('team_b', '').split(',') if x]
-            winner = match.get('winner')
-            # Sets: prefer set_scores formatting, fallback to set_winners
-            sets_str = ""
+        rows = []
+        for m in matches:
+            mode = str(m.get("mode", ""))
+            team_a_ids = [int(x) for x in (m.get("team_a") or "").split(",") if x]
+            team_b_ids = [int(x) for x in (m.get("team_b") or "").split(",") if x]
+            winner = m.get("winner")
             try:
-                set_scores = json.loads(match.get('set_scores') or '[]')
-                if set_scores:
-                    sets_str = fmt.score_sets(set_scores)
+                set_scores = json.loads(m.get("set_scores") or "[]")
+                sets_str = fmt.score_sets(set_scores) if set_scores else ""
             except Exception:
                 sets_str = ""
             if not sets_str:
-                sets_str = str(match.get('set_winners') or '')
-
-            user_team = 'A' if user.id in team_a_ids else 'B'
-            result = 'WIN' if (winner == user_team) else 'LOSS'
+                sets_str = str(m.get("set_winners") or "")
+            user_team = "A" if user.id in team_a_ids else "B"
+            result = "WIN" if (winner == user_team) else "LOSS"
             rows.append([mode, f"Team {user_team}", sets_str, result])
-        recent_block = fmt.mono_table(rows, headers=headers)
+        # mono table (fmt.mono_table) is optional; keep it simple here
+        recent_block = "\n".join(f"- {a} | {b} | {c} | {d}" for a, b, c, d in rows)
     else:
         recent_block = "*No recent matches found.*"
 
-    user_display = user.display_name if hasattr(user, 'display_name') and user.display_name else user.name
-    message = (
-        f"## 📊 Stats for {user_display}\n\n"
-        + "\n".join(kv_lines)
-        + (f"\n\n**Recent Matches (Last {len(matches)}):**\n" + recent_block if matches else f"\n\n{recent_block}")
+    display = user.display_name if getattr(user, "display_name", None) else user.name
+    msg = f"## 📊 Stats for {display}\n\n" + "\n".join(kv_lines) + f"\n\n**Recent Matches:**\n{recent_block}"
+    await inter.followup.send(msg, allowed_mentions=ALLOWED_MENTIONS, ephemeral=True)
+
+# ---- Singles (players, then 6 dropdowns) ----
+@tree.command(name="match_singles", description="Report a singles match (pick players, then select scores)")
+@app_commands.describe(a="Player A", b="Player B", target="Target points (11 or 21)")
+@app_commands.choices(target=[
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
+])
+async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.User, target: int = 21):
+    if not await require_tos(inter):
+        return
+    cap = derive_cap(target)
+
+    async def on_submit(i2: discord.Interaction, set_scores: list[dict]):
+        try:
+            # Validates per-set and determines winner & points
+            _winner, _sa, _sb, _pts_a, _pts_b = match_winner(set_scores, target=target, win_by=POINTS_WIN_BY, cap=cap)
+        except Exception as e:
+            return await i2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
+
+        mid = await db.insert_pending_match_points(
+            guild_id=inter.guild_id or 0,
+            mode="1v1",
+            team_a=[a.id],
+            team_b=[b.id],
+            set_scores=set_scores,
+            reporter=inter.user.id,
+            target_points=target
+        )
+        await notify_verification(mid)
+        await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+
+    view = PointsScoreView(target=target, cap=cap, on_submit=on_submit)
+    await inter.response.send_message(
+        content=f"Select set scores for {a.mention} vs {b.mention} (to {target}, win by {POINTS_WIN_BY}).",
+        view=view, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS
     )
 
-    await interaction.followup.send(message, allowed_mentions=ALLOWED_MENTIONS)
-    log.debug("Sent stats for user=%s guild=%s", user.id, interaction.guild_id)
+# ---- Doubles (players, then 6 dropdowns) ----
+@tree.command(name="match_doubles", description="Report a 2v2 match (pick players, then select scores)")
+@app_commands.describe(
+    a1="Team A - Player 1", a2="Team A - Player 2",
+    b1="Team B - Player 1", b2="Team B - Player 2",
+    target="Target points (11 or 21)"
+)
+@app_commands.choices(target=[
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
+])
+async def match_doubles(
+    inter: discord.Interaction,
+    a1: discord.User, a2: discord.User,
+    b1: discord.User, b2: discord.User,
+    target: int = 21
+):
+    if not await require_tos(inter):
+        return
+    all_ids = [a1.id, a2.id, b1.id, b2.id]
+    if len(set(all_ids)) != 4:
+        return await inter.response.send_message("❌ All four players must be different.", ephemeral=True)
+    cap = derive_cap(target)
 
+    async def on_submit(i2: discord.Interaction, set_scores: list[dict]):
+        try:
+            _winner, _sa, _sb, _pts_a, _pts_b = match_winner(set_scores, target=target, win_by=POINTS_WIN_BY, cap=cap)
+        except Exception as e:
+            return await i2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
 
+        mid = await db.insert_pending_match_points(
+            guild_id=inter.guild_id or 0,
+            mode="2v2",
+            team_a=[a1.id, a2.id],
+            team_b=[b1.id, b2.id],
+            set_scores=set_scores,
+            reporter=inter.user.id,
+            target_points=target
+        )
+        await notify_verification(mid)
+        await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+
+    view = PointsScoreView(target=target, cap=cap, on_submit=on_submit)
+    def disp(u: discord.User) -> str:
+        return getattr(u, "display_name", None) or u.name
+    await inter.response.send_message(
+        content=f"Select set scores for {disp(a1)}/{disp(a2)} vs {disp(b1)}/{disp(b2)} (to {target}, win by {POINTS_WIN_BY}).",
+        view=view, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS
+    )
+
+# Verify (command)
 @tree.command(name="verify", description="Verify a pending match")
 @app_commands.describe(
     decision="approve or reject",
     name="Your name as you want it recorded (optional)",
-    match_id="Match ID to verify (optional; defaults to latest pending)"
+    match_id="Match ID (optional; defaults to latest pending you’re in)"
 )
 @app_commands.choices(decision=[
     app_commands.Choice(name="approve", value="approve"),
@@ -598,12 +420,8 @@ async def verify(
     name: str | None = None,
     match_id: int | None = None,
 ):
-    # Ensure DB is initialized (safe to call repeatedly)
     await db.init_db(DATABASE_PATH)
-
-    # Check ToS acceptance first (defensive: create table if missing)
-    accepted = await has_accepted_tos_safe(inter.user.id)
-    if not accepted:
+    if not await has_accepted_tos_safe(inter.user.id):
         return await inter.response.send_message(
             "Please run `/agree_tos name:<Your Name>` first, then verify again.",
             ephemeral=True
@@ -611,265 +429,129 @@ async def verify(
 
     await inter.response.defer(ephemeral=True)
 
-    try:
-        # Auto-select latest pending match if match_id not provided
-        selected_id: int
-        if match_id is None:
-            row = await db.latest_pending_for_user(inter.guild_id or 0, inter.user.id)
-            if not row:
-                await inter.followup.send("No pending matches to verify.", ephemeral=True)
-                return
-            selected_id = row["id"]
-        else:
-            selected_id = match_id
+    # Pick latest pending if no ID provided
+    if match_id is None:
+        row = await db.latest_pending_for_user(inter.guild_id or 0, inter.user.id)
+        if not row:
+            return await inter.followup.send("No pending matches to verify.", ephemeral=True)
+        match_id = row["id"]
 
-        # Default name to user's display name if not provided
-        if name is None:
-            name = (inter.user.display_name or inter.user.name)[:60]
-        else:
-            name = name.strip()[:60]
+    name = (name or (inter.user.display_name or inter.user.name))[:60]
 
-        # Validate match and permissions
-        match = await get_match(selected_id)
-        if not match:
-            await inter.followup.send(f"❌ Match ID {selected_id} not found.", ephemeral=True)
-            log.warning("Verify failed: match not found id=%s user=%s", selected_id, inter.user.id)
-            return
-        participants = await get_match_participant_ids(selected_id)
-        if inter.user.id not in participants:
-            await inter.followup.send("❌ You are not a participant in this match.", ephemeral=True)
-            log.warning("Verify blocked: non-participant user=%s match=%s", inter.user.id, selected_id)
-            return
-        if inter.user.id == match.get("reporter"):
-            await inter.followup.send("❌ The reporter cannot verify their own match.", ephemeral=True)
-            log.warning("Verify blocked: reporter self-verify user=%s match=%s", inter.user.id, selected_id)
-            return
+    match = await db.get_match(match_id)
+    if not match:
+        return await inter.followup.send(f"❌ Match ID {match_id} not found.", ephemeral=True)
 
-        # Record signature
-        await db.add_signature(selected_id, inter.user.id, decision, name)
+    participants = await db.get_match_participant_ids(match_id)
+    if inter.user.id not in participants:
+        return await inter.followup.send("❌ You are not a participant in this match.", ephemeral=True)
+    if inter.user.id == match.get("reporter"):
+        return await inter.followup.send("❌ The reporter cannot verify their own match.", ephemeral=True)
 
-        # Try to finalize (handles rejection and approval finalization)
-        await try_finalize_match(selected_id)
+    await db.add_signature(match_id, inter.user.id, decision, name)
+    await try_finalize_match(match_id)
 
-        # Send confirmation using fmt helpers
-        hint = fmt.block("/verify decision:approve name:YourName\n/verify decision:reject name:YourName", "md")
-        msg = (
-            f"{fmt.bold('Verification recorded')}\n"
-            f"Match: {fmt.code(str(selected_id))}\n"
-            f"Decision: {fmt.code(decision)}\n"
-            f"Name: {fmt.code(name)}"
-        )
-        await inter.followup.send(msg + "\n\n" + hint, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
-        log.info("Verify recorded: match=%s user=%s decision=%s name=%s", selected_id, inter.user.id, decision, name)
+    hint = fmt.block("/verify decision:approve name:YourName\n/verify decision:reject name:YourName", "md")
+    msg = (
+        f"{fmt.bold('Verification recorded')}\n"
+        f"Match: {fmt.code(str(match_id))}\n"
+        f"Decision: {fmt.code(decision)}\n"
+        f"Name: {fmt.code(name)}"
+    )
+    await inter.followup.send(msg + "\n\n" + hint, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
 
-    except Exception as e:
-        log.exception("Error in /verify for user=%s", inter.user.id)
-        try:
-            await inter.followup.send(f"❌ Failed to verify: {e}", ephemeral=True)
-        except Exception:
-            pass
-
+# Pending
 @tree.command(name="pending", description="List your matches awaiting your verification")
-async def pending(interaction: discord.Interaction):
-    if not await require_tos(interaction):
+async def pending(inter: discord.Interaction):
+    if not await require_tos(inter):
         return
-    await interaction.response.defer(ephemeral=True)
-    guild_id = interaction.guild_id or 0
-    user_id = interaction.user.id
-    matches = await list_pending_for_user(user_id, guild_id)
+
+    await inter.response.defer(ephemeral=True)
+    guild_id = inter.guild_id or 0
+    user_id = inter.user.id
+
+    matches = await db.list_pending_for_user(user_id, guild_id)
     if not matches:
-        await interaction.followup.send("You have no pending matches to verify!", ephemeral=True)
-        log.debug("No pending matches for user=%s guild=%s", user_id, guild_id)
-        return
+        return await inter.followup.send("You have no pending matches to verify!", ephemeral=True)
 
-    # Filter out already-signed matches for this user
-    unsigned_matches = []
-    for match in matches:
-        match_id = match['id']
-        signatures = await get_signatures(match_id)
-        if any(sig['user_id'] == user_id for sig in signatures):
+    # Filter out already-signed
+    unsigned = []
+    for m in matches:
+        sigs = await db.get_signatures(m["id"])
+        if any(s["user_id"] == user_id for s in sigs):
             continue
-        unsigned_matches.append((match, signatures))
-
-    if not unsigned_matches:
-        await interaction.followup.send("You have no pending matches to verify!", ephemeral=True)
-        return
-
-    # Resolve usernames for participants
-    name_cache: dict[int, str] = {}
-    async def name_of(uid: int) -> str:
-        if uid in name_cache:
-            return name_cache[uid]
-        # Prefer guild display name if available
-        member = None
-        if interaction.guild:
-            member = interaction.guild.get_member(uid)
-        if member is not None:
-            name_cache[uid] = f"@{member.display_name}"
-            return name_cache[uid]
-        try:
-            user = await bot.fetch_user(uid)
-            name_cache[uid] = f"@{getattr(user, 'display_name', None) or user.name}"
-        except Exception:
-            name_cache[uid] = f"@{uid}"
-        return name_cache[uid]
+        unsigned.append((m, sigs))
+    if not unsigned:
+        return await inter.followup.send("You have no pending matches to verify!", ephemeral=True)
 
     headers = ["Match", "Mode", "Teams", "Sets"]
-    rows: list[list[str]] = []
-    for match, _sigs in unsigned_matches:
-        mid = match['id']
-        mode = match.get('mode', '')
-        team_a_ids = [int(x) for x in match.get('team_a', '').split(',') if x]
-        team_b_ids = [int(x) for x in match.get('team_b', '').split(',') if x]
-        # Build team strings with usernames (no pings)
-        a_names = [await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=f"User{uid}") for uid in team_a_ids]
-        b_names = [await fmt.display_name_or_cached(bot, interaction.guild, uid, fallback=f"User{uid}") for uid in team_b_ids]
-        teams = f"{'/'.join(a_names)} vs {'/'.join(b_names)}"
-        # Sets: parse set_scores and format using fmt.score_sets; fallback to N/A
+    rows = []
+    for m, _ in unsigned:
+        mid = m["id"]
+        mode = m.get("mode", "")
+        a_ids = [int(x) for x in (m.get("team_a") or "").split(",") if x]
+        b_ids = [int(x) for x in (m.get("team_b") or "").split(",") if x]
+        a_names = [await fmt.display_name_or_cached(bot, inter.guild, uid, fallback=f"User{uid}") for uid in a_ids]
+        b_names = [await fmt.display_name_or_cached(bot, inter.guild, uid, fallback=f"User{uid}") for uid in b_ids]
         try:
-            set_scores = json.loads(match.get('set_scores') or '[]')
+            s = json.loads(m.get("set_scores") or "[]")
+            sets_str = fmt.score_sets(s) if s else "N/A"
         except Exception:
-            set_scores = []
-        sets_str = fmt.score_sets(set_scores) if set_scores else "N/A"
-        rows.append([f"#{mid}", str(mode), teams, sets_str])
+            sets_str = "N/A"
+        rows.append([f"#{mid}", str(mode), f"{'/'.join(a_names)} vs {'/'.join(b_names)}", sets_str])
 
     table = fmt.mono_table(rows, headers=headers)
-    # Autofill name with user's display name or username
-    autofill_name = interaction.user.display_name if hasattr(interaction.user, 'display_name') and interaction.user.display_name else interaction.user.name
-    approve_box = fmt.block(f"/verify match_id:<ID> decision:approve name:{autofill_name}", "md")
-    reject_box = fmt.block(f"/verify match_id:<ID> decision:reject name:{autofill_name}", "md")
-    instructions = f"Approve:\n{approve_box}\nReject:\n{reject_box}"
-    await interaction.followup.send(table + "\n" + instructions, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
-    log.debug("Listed %s pending matches for user=%s guild=%s", len(rows), user_id, guild_id)
+    autofill = inter.user.display_name if getattr(inter.user, "display_name", None) else inter.user.name
+    approve_box = fmt.block(f"/verify match_id:<ID> decision:approve name:{autofill}", "md")
+    reject_box  = fmt.block(f"/verify match_id:<ID> decision:reject  name:{autofill}", "md")
+    await inter.followup.send(table + "\nApprove:\n" + approve_box + "\nReject:\n" + reject_box,
+                              ephemeral=True, allowed_mentions=ALLOWED_MENTIONS)
 
-# --- Finalize match stub ---
-async def finalize_match(match_id: int):
-    import json
-    from feather_rank.rules import match_winner
-    from feather_rank.mmr import team_points_update
-    match = await get_match(match_id)
-    if not match:
-        log.error("Finalize failed: match not found id=%s", match_id)
-        return
-    team_a_ids = [int(x) for x in match['team_a'].split(',') if x]
-    team_b_ids = [int(x) for x in match['team_b'].split(',') if x]
-    mode = match.get('mode')
-    # Load set_scores
-    try:
-        set_scores = json.loads(match.get('set_scores') or '[]')
-    except Exception:
-        set_scores = []
-        log.exception("Failed to parse set_scores for match=%s", match_id)
-    # Get target_points from match or use default
-    target_points = match.get('target_points') or POINTS_TARGET_DEFAULT
-    cap = derive_cap(target_points)
-    # Compute winner, points
-    winner, sa, sb, pts_a, pts_b = match_winner(
-        set_scores,
-        target_points,
-        POINTS_WIN_BY,
-        cap
-    )
-    share_a = pts_a / max(1, (pts_a + pts_b))
-    # Get player info
-    players_a = [await get_or_create_player(uid, f"User{uid}") for uid in team_a_ids]
-    players_b = [await get_or_create_player(uid, f"User{uid}") for uid in team_b_ids]
-    ratings_a = [p['rating'] for p in players_a]
-    ratings_b = [p['rating'] for p in players_b]
-    # Update ratings using points share
-    new_ratings_a, new_ratings_b = team_points_update(ratings_a, ratings_b, share_a, k=K_FACTOR)
-    # Update players' ratings and W/L
-    for i, p in enumerate(players_a):
-        await update_player(p['user_id'], new_ratings_a[i], won=(winner == 'A'))
-    for i, p in enumerate(players_b):
-        await update_player(p['user_id'], new_ratings_b[i], won=(winner == 'B'))
-    # Finalize match in DB
-    from feather_rank.db import finalize_points
-    await finalize_points(match_id, winner, set_scores, pts_a, pts_b)
-    log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, pts_a, pts_b)
-    # Build summary with per-set scores
-    summary = f"🏸 **Match Verified** — to {target_points}, win by {POINTS_WIN_BY}\n"
-    summary += f"Match ID: {match_id}\nMode: {mode}\nWinner: Team {winner}\n"
-    summary += f"Team A: {', '.join(str(uid) for uid in team_a_ids)}\n"
-    summary += f"Team B: {', '.join(str(uid) for uid in team_b_ids)}\n"
-    summary += "Set Scores:\n"
-    for idx, s in enumerate(set_scores, 1):
-        summary += f"  Set {idx}: A {s.get('A', 0)} - B {s.get('B', 0)}\n"
-    summary += f"Total Points: A {pts_a} - B {pts_b}\n"
-    # Try to post in channel (if available)
-    channel_id = match.get('channel_id')
-    sent = False
-    if channel_id:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-            # Only send to channels that support .send (TextChannel, Thread)
-            if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                await channel.send(summary)
-            else:
-                raise TypeError(f"Unsupported channel type: {type(channel)}")
-            sent = True
-        except Exception:
-            log.warning("Failed to post summary to channel_id=%s for match=%s", channel_id, match_id, exc_info=True)
-    # Fallback: DM reporter
-    if not sent:
-        reporter_id = match.get('reporter')
-        if reporter_id:
-            try:
-                user = await bot.fetch_user(reporter_id)
-                await user.send(summary)
-            except Exception:
-                log.warning("Failed to DM reporter=%s for match=%s", reporter_id, match_id, exc_info=True)
-
+# --- Verification utilities ---
 async def notify_verification(match_id: int):
-    match = await get_match(match_id)
+    match = await db.get_match(match_id)
     if not match:
         log.error("Notify failed: match not found id=%s", match_id)
         return
-    participants = await get_match_participant_ids(match_id)
+
+    participants = await db.get_match_participant_ids(match_id)
     reporter = match.get("reporter")
     non_reporters = [uid for uid in participants if uid != reporter]
-    # Build formatted message with mentions and display names
-    guild_id = match.get('guild_id')
+
+    guild_id = match.get("guild_id")
     guild = bot.get_guild(guild_id) if guild_id else None
-    
-    # Build Markdown message
-    title = fmt.bold(f"Please verify Match #{match_id}")
-    
-    # Teams as "A vs B" string using display names for each user id
-    team_a_ids = [int(x) for x in (match.get('team_a') or '').split(',') if x]
-    team_b_ids = [int(x) for x in (match.get('team_b') or '').split(',') if x]
-    team_a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_a_ids]
-    team_b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_b_ids]
-    teams = f"{'/'.join(team_a_names)} vs {'/'.join(team_b_names)}"
-    
-    # Sets using fmt.score_sets
+
+    # Teams
+    a_ids = [int(x) for x in (match.get("team_a") or "").split(",") if x]
+    b_ids = [int(x) for x in (match.get("team_b") or "").split(",") if x]
+    a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in a_ids]
+    b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in b_ids]
+
+    # Sets
     try:
-        set_scores = json.loads(match.get('set_scores') or '[]')
+        set_scores = json.loads(match.get("set_scores") or "[]")
     except Exception:
         set_scores = []
-    sets = fmt.score_sets(set_scores) if set_scores else "N/A"
-    
-    # Tip block
-    tip = fmt.block("/verify decision:approve name:YourName\n/verify decision:reject name:YourName", "md")
-    
-    # Complete message
-    msg = f"{title}\n{teams}\n{sets}\nReact {EMOJI_APPROVE} to approve or {EMOJI_REJECT} to reject.\n\n{tip}"
-    
-    # For each non-reporter participant
+    sets_line = fmt.score_sets(set_scores) if set_scores else "N/A"
+
+    title = fmt.bold(f"Please verify Match #{match_id}")
+    tip = fmt.block("/verify\n/verify decision:approve name:YourName\n/verify decision:reject name:YourName", "md")
+    msg = f"{title}\n{'/'.join(a_names)} vs {'/'.join(b_names)}\n{sets_line}\nReact {EMOJI_APPROVE} to approve or {EMOJI_REJECT} to reject.\n\n{tip}"
+
     for user_id in non_reporters:
         try:
             user = await bot.fetch_user(user_id)
             dm = await user.send(msg, allowed_mentions=ALLOWED_MENTIONS)
-            await dm.add_reaction(EMOJI_APPROVE)
-            await dm.add_reaction(EMOJI_REJECT)
+            try:
+                await dm.add_reaction(EMOJI_APPROVE)
+                await dm.add_reaction(EMOJI_REJECT)
+            except Exception:
+                pass
             await db.record_verification_message(dm.id, match_id, guild_id, user_id)
         except discord.Forbidden:
-            # Fallback in the reporting channel/thread
+            # Fallback to a channel we can post in
             try:
-                channel = None
-                if guild and getattr(guild, "system_channel", None):
-                    channel = guild.system_channel
-                # Find first text channel we can send in
+                channel = getattr(guild, "system_channel", None)
                 if channel is None:
                     for ch in getattr(guild, "channels", []) or []:
                         if isinstance(ch, discord.TextChannel) and ch.permissions_for(ch.guild.me).send_messages:
@@ -877,249 +559,88 @@ async def notify_verification(match_id: int):
                             break
                 if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
                     post = await channel.send(msg, allowed_mentions=ALLOWED_MENTIONS)
-                    await post.add_reaction(EMOJI_APPROVE)
-                    await post.add_reaction(EMOJI_REJECT)
+                    try:
+                        await post.add_reaction(EMOJI_APPROVE)
+                        await post.add_reaction(EMOJI_REJECT)
+                    except Exception:
+                        pass
                     await db.record_verification_message(post.id, match_id, guild_id, user_id)
-                else:
-                    log.warning("No suitable channel to post verification for user=%s match=%s", user_id, match_id)
             except Exception:
-                log.warning("Channel fallback failed for user=%s match=%s", user_id, match_id, exc_info=True)
-        except Exception:
-            log.warning("Failed to notify user=%s for verification of match=%s", user_id, match_id, exc_info=True)
-
-@bot.event
-async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
-    if not bot.user or payload.user_id == bot.user.id: return
-    row = await db.get_verification_message(payload.message_id)
-    if not row: return
-    if payload.user_id != row["user_id"]: return
-
-    emoji = str(payload.emoji)
-    if   emoji == EMOJI_APPROVE: decision = "approve"
-    elif emoji == EMOJI_REJECT:  decision = "reject"
-    else: return
-
-    if not await has_accepted_tos_safe(payload.user_id):
-        ch = await bot.fetch_channel(payload.channel_id)
-        try:
-            msg = await ch.fetch_message(payload.message_id)
-            await msg.reply("Please run `/agree_tos name:<Your Name>` first, then react again.", mention_author=False, allowed_mentions=ALLOWED_MENTIONS)
-        except: pass
-        return
-
-    tos = await db.get_tos(payload.user_id)
-    signed_name = (tos["signed_name"] if tos and tos.get("signed_name") else None)
-    if not signed_name:
-        # fallback to current display name if available
-        guild = bot.get_guild(row["guild_id"]) if row["guild_id"] else None
-        member = guild.get_member(payload.user_id) if guild else None
-        signed_name = (member.display_name if member else "Unknown")[:60]
-
-    await db.add_signature(row["match_id"], payload.user_id, decision, signed_name)
-    await db.delete_verification_message(payload.message_id)
-
-    # Acknowledge
-    try:
-        ch = await bot.fetch_channel(payload.channel_id)
-        msg = await ch.fetch_message(payload.message_id)
-        await msg.reply(f"Verification recorded as `{signed_name}` ({decision}).", mention_author=False, allowed_mentions=ALLOWED_MENTIONS)
-    except: pass
-
-    await try_finalize_match(row["match_id"])
+                log.debug("Channel fallback failed for user=%s match=%s", user_id, match_id, exc_info=True)
 
 async def try_finalize_match(match_id: int):
     """
-    Try to finalize a match based on verification signatures.
-    - If any signature is 'reject': set status='rejected' and notify all parties
-    - Determine required approvers based on mode (singles: 1, doubles: 3)
-    - If all required approvers have approved: call finalize_points() and set status='verified'
-    - Otherwise: do nothing (still pending)
+    Finalize when:
+      - any 'reject' -> rejected
+      - singles: 1 approval (opponent)
+      - doubles: approvals from all 3 non-reporters
+    On verify: update ratings via points-share Elo and set status='verified'.
     """
-    import json
-    from feather_rank.rules import match_winner
-    from feather_rank.mmr import team_points_update
-    from feather_rank.db import finalize_points
-    
-    # Load match, participants, reporter, and signatures
-    match = await get_match(match_id)
+    match = await db.get_match(match_id)
     if not match:
         log.error("try_finalize: match not found id=%s", match_id)
         return
-    
-    participants = await get_match_participant_ids(match_id)
+
+    participants = await db.get_match_participant_ids(match_id)
     reporter = match.get("reporter")
-    sigs = await get_signatures(match_id)
-    guild_id = match.get('guild_id')
-    guild = bot.get_guild(guild_id) if guild_id else None
-    
-    # Parse teams
-    team_a_ids = [int(x) for x in (match.get('team_a') or '').split(',') if x]
-    team_b_ids = [int(x) for x in (match.get('team_b') or '').split(',') if x]
-    mode = match.get('mode', '2v2')
-    
-    # If any signature.decision == 'reject': set status='rejected' and notify
+    sigs = await db.get_signatures(match_id)
+
+    # Rejected?
     if any(s.get("decision") == "reject" for s in sigs):
-        await set_match_status(match_id, "rejected")
+        await db.set_match_status(match_id, "rejected")
         log.info("Match #%s rejected by participant(s)", match_id)
-        
-        # Build rejection summary with Markdown
-        title = fmt.bold(f"Match #{match_id} Rejected")
-        guild = bot.get_guild(match.get('guild_id')) if match.get('guild_id') else None
-        team_a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_a_ids]
-        team_b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in team_b_ids]
-        teams_line = f"{'/'.join(team_a_names)} vs {'/'.join(team_b_names)}"
-        
-        # Include who rejected
-        rejectors = [s.get("user_id") for s in sigs if s.get("decision") == "reject"]
-        rejector_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in rejectors if uid]
-        
-        rejection_msg = f"{title}\n{teams_line}\nRejected by: {', '.join(rejector_names)}"
-        
-        # Notify reporter
-        if reporter:
-            try:
-                user = await bot.fetch_user(reporter)
-                await user.send(rejection_msg, allowed_mentions=ALLOWED_MENTIONS)
-            except Exception:
-                log.debug("Failed to DM reporter=%s for rejected match=%s", reporter, match_id)
-        
-        # Notify all participants
-        for pid in participants:
-            if pid != reporter:  # Don't double-notify reporter
-                try:
-                    user = await bot.fetch_user(pid)
-                    await user.send(rejection_msg, allowed_mentions=ALLOWED_MENTIONS)
-                except Exception:
-                    log.debug("Failed to DM participant=%s for rejected match=%s", pid, match_id)
-        
         return
-    
-    # Determine required approvers based on mode
+
     non_reporters = [pid for pid in participants if pid != reporter]
-    
-    if mode == "1v1":
-        # Singles: opponent only (1 non-reporter)
-        required_approvers = non_reporters[:1]  # Should be exactly 1
-    else:
-        # Doubles: all 3 non-reporters
-        required_approvers = non_reporters
-    
-    # Check if all required have decision='approve'
+    required = non_reporters[:1] if match.get("mode") == "1v1" else non_reporters
     approved_users = {s.get("user_id") for s in sigs if s.get("decision") == "approve"}
-    all_approved = all(uid in approved_users for uid in required_approvers)
-    
-    if not all_approved:
-        # Still pending
-        log.debug("Match #%s still pending approval", match_id)
-        return
-    
-    # All required approvers have approved - finalize the match
-    log.info("Match #%s: all required approvals received, finalizing", match_id)
-    
-    # Load set_scores
+    if not all(uid in approved_users for uid in required):
+        return  # still pending
+
+    # Compute outcome + rating updates
     try:
-        set_scores = json.loads(match.get('set_scores') or '[]')
+        set_scores = json.loads(match.get("set_scores") or "[]")
     except Exception:
         set_scores = []
-        log.exception("Failed to parse set_scores for match=%s", match_id)
-    
-    # Get target_points from match or use default
-    target_points = match.get('target_points') or POINTS_TARGET_DEFAULT
+    target_points = match.get("target_points") or POINTS_TARGET_DEFAULT
     cap = derive_cap(target_points)
-    
-    # Compute winner and points
-    winner, sa, sb, pts_a, pts_b = match_winner(
-        set_scores,
-        target_points,
-        POINTS_WIN_BY,
-        cap
-    )
-    share_a = pts_a / max(1, (pts_a + pts_b))
-    
-    # Get player info
-    players_a = [await get_or_create_player(uid, f"User{uid}") for uid in team_a_ids]
-    players_b = [await get_or_create_player(uid, f"User{uid}") for uid in team_b_ids]
-    ratings_a = [p['rating'] for p in players_a]
-    ratings_b = [p['rating'] for p in players_b]
-    
-    # Update ratings using points share
-    new_ratings_a, new_ratings_b = team_points_update(ratings_a, ratings_b, share_a, k=K_FACTOR)
-    
-    # Update players' ratings and W/L
-    for i, p in enumerate(players_a):
-        await update_player(p['user_id'], new_ratings_a[i], won=(winner == 'A'))
-    for i, p in enumerate(players_b):
-        await update_player(p['user_id'], new_ratings_b[i], won=(winner == 'B'))
-    
-    # Call finalize_points then set status='verified'
-    await finalize_points(match_id, winner, set_scores, pts_a, pts_b)
-    await set_match_status(match_id, "verified")
-    
-    log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, pts_a, pts_b)
-    
-    # Post public summary (channel/thread) with display names only (no pings)
-    title = fmt.bold(f"🏸 Match #{match_id} Verified — to {target_points}, win by {POINTS_WIN_BY}")
-    
-    # Build team lines with display names
-    team_a_lines = []
-    for uid in team_a_ids:
-        display = await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}")
-        team_a_lines.append(f"{display}")
-    
-    team_b_lines = []
-    for uid in team_b_ids:
-        display = await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}")
-        team_b_lines.append(f"{display}")
-    
-    teams_section = f"**Team A:**\n" + "\n".join(team_a_lines) + f"\n\n**Team B:**\n" + "\n".join(team_b_lines)
-    
-    # Set scores
-    sets_section = "**Set Scores:**\n"
-    for idx, s in enumerate(set_scores, 1):
-        sets_section += f"  Set {idx}: A {s.get('A', 0)} - B {s.get('B', 0)}\n"
-    
-    # Winner and points
-    winner_line = f"**Winner:** Team {winner}"
-    points_line = f"**Total Points:** A {pts_a} - B {pts_b}"
-    
-    summary = f"{title}\n{teams_section}\n\n{sets_section}\n{winner_line}\n{points_line}"
-    
-    # Try to post in channel/thread
-    channel_id = match.get('channel_id')
-    sent = False
-    if channel_id:
-        try:
-            channel = await bot.fetch_channel(channel_id)
-            if isinstance(channel, (discord.TextChannel, discord.Thread)):
-                await channel.send(summary, allowed_mentions=ALLOWED_MENTIONS)
-                sent = True
-        except Exception:
-            log.warning("Failed to post summary to channel_id=%s for match=%s", channel_id, match_id, exc_info=True)
-    
-    # Fallback: DM reporter
-    if not sent and reporter:
-        try:
-            user = await bot.fetch_user(reporter)
-            await user.send(summary, allowed_mentions=ALLOWED_MENTIONS)
-        except Exception:
-            log.warning("Failed to DM reporter=%s for match=%s", reporter, match_id, exc_info=True)
 
-# Run the bot
+    winner, _sa, _sb, pts_a, pts_b = match_winner(set_scores, target_points, POINTS_WIN_BY, cap)
+    share_a = pts_a / max(1, (pts_a + pts_b))
+
+    a_ids = [int(x) for x in (match.get("team_a") or "").split(",") if x]
+    b_ids = [int(x) for x in (match.get("team_b") or "").split(",") if x]
+
+    players_a = [await db.get_or_create_player(uid, f"User{uid}") for uid in a_ids]
+    players_b = [await db.get_or_create_player(uid, f"User{uid}") for uid in b_ids]
+    ratings_a = [p["rating"] for p in players_a]
+    ratings_b = [p["rating"] for p in players_b]
+
+    new_ratings_a, new_ratings_b = team_points_update(ratings_a, ratings_b, share_a, k=K_FACTOR)
+
+    for i, p in enumerate(players_a):
+        await db.update_player(p["user_id"], new_ratings_a[i], won=(winner == "A"))
+    for i, p in enumerate(players_b):
+        await db.update_player(p["user_id"], new_ratings_b[i], won=(winner == "B"))
+
+    await db.finalize_points(match_id, winner, set_scores, pts_a, pts_b)
+    await db.set_match_status(match_id, "verified")
+    log.info("Match #%s finalized (winner=%s)", match_id, winner)
+
+# --- Entrypoint ---
 if __name__ == "__main__":
     if not TOKEN:
-        log.error("DISCORD_TOKEN not set. Please provide it via environment or .env file.")
+        log.error("DISCORD_TOKEN not set. Put it in environment or .env")
         raise SystemExit(1)
-    # Ensure DB schema exists before logging in the bot
+
+    # Ensure schema before login (on_ready will also ensure)
     try:
-        import asyncio as _asyncio
-        loop = _asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
         if loop.is_running():
-            # In case of being embedded, schedule init
             loop.create_task(db.init_db(DATABASE_PATH))
         else:
             loop.run_until_complete(db.init_db(DATABASE_PATH))
     except Exception:
-        # Best effort; on_ready will also ensure
         log.debug("Pre-start DB init failed", exc_info=True)
-    log.info("Starting bot… (mode=%s)", "TEST" if TEST_MODE else "PROD")
+
     bot.run(TOKEN)
