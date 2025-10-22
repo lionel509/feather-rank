@@ -347,7 +347,13 @@ async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.
         await notify_verification(mid)
         await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
 
-    view = PointsScoreView(target=target, cap=cap, on_submit=on_submit)
+    # Pager-based score picker view
+    try:
+        from views import PointsScorePagerView  # local views module
+    except Exception:
+        # Fallback to legacy if import fails
+        PointsScorePagerView = PointsScoreView  # type: ignore
+    view = PointsScorePagerView(target=target, cap=cap, on_submit=on_submit)
     await inter.response.send_message(
         content=f"Select set scores for {a.mention} vs {b.mention} (to {target}, win by {POINTS_WIN_BY}).",
         view=view, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS
@@ -395,7 +401,12 @@ async def match_doubles(
         await notify_verification(mid)
         await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
 
-    view = PointsScoreView(target=target, cap=cap, on_submit=on_submit)
+    # Pager-based score picker view
+    try:
+        from views import PointsScorePagerView  # local views module
+    except Exception:
+        PointsScorePagerView = PointsScoreView  # type: ignore
+    view = PointsScorePagerView(target=target, cap=cap, on_submit=on_submit)
     def disp(u: discord.User) -> str:
         return getattr(u, "display_name", None) or u.name
     await inter.response.send_message(

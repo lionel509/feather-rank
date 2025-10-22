@@ -44,6 +44,121 @@ class PointsScoreView(discord.ui.View):
             if v and v.get("A") is not None and v.get("B") is not None:
                 sets.append({"A": int(v["A"]), "B": int(v["B"])});
         await self.on_submit(interaction, sets)
+
+# --- New pager-based scoring UI with two-tier number picker ---
+
+def _ranges_for_cap(cap:int) -> list[tuple[int,int]]:
+    if cap <= 15:
+        return [(0,10), (11,cap)]
+    return [(0,10), (11,21), (22,cap)]
+
+class NumberPicker(discord.ui.Select):
+    def __init__(self, set_idx:int, side:str, target:int, cap:int|None, value:int|None=None, row:int|None=None):
+        self.set_idx, self.side = set_idx, side
+        self.cap = cap or (30 if target >= 21 else 15)
+        self._value = value
+        self.mode = "range"  # or "exact"
+        self.current_range: tuple[int,int] | None = None
+        super().__init__(placeholder=self._ph(), min_values=1, max_values=1, options=self._range_options(), row=row)
+
+    def _ph(self) -> str:
+        suffix = f" (picked {self._value})" if self._value is not None else ""
+        who = "A" if self.side == "A" else "B"
+        return f"Set {self.set_idx} — {who} points{suffix}"
+
+    def _range_options(self):
+        opts = [discord.SelectOption(label=f"{lo}–{hi}", value=f"R:{lo}:{hi}") for lo,hi in _ranges_for_cap(self.cap)]
+        if self._value is not None:
+            opts.append(discord.SelectOption(label=f"Clear (was {self._value})", value="CLR"))
+        return opts
+
+    def _exact_options(self, lo:int, hi:int):
+        return [discord.SelectOption(label=str(i), value=f"N:{i}") for i in range(lo, hi+1)]
+
+    async def _to_exact(self, interaction: discord.Interaction, lo:int, hi:int):
+        self.mode = "exact"
+        self.current_range = (lo, hi)
+        self.options = self._exact_options(lo, hi)
+        self.placeholder = self._ph()
+        await interaction.response.edit_message(view=self.view)
+
+    async def _to_range(self, interaction: discord.Interaction):
+        self.mode = "range"
+        self.current_range = None
+        self.options = self._range_options()
+        self.placeholder = self._ph()
+        await interaction.response.edit_message(view=self.view)
+
+    async def callback(self, interaction: discord.Interaction):
+        v = self.values[0]
+        if v == "CLR":
+            self._value = None
+            view = getattr(self, "view", None)
+            if view is not None:
+                view.choices.setdefault(self.set_idx, {"A": None, "B": None})
+                view.choices[self.set_idx][self.side] = None
+            await self._to_range(interaction)
+            return
+        if v.startswith("R:"):
+            _, lo, hi = v.split(":")
+            await self._to_exact(interaction, int(lo), int(hi))
+            return
+        if v.startswith("N:"):
+            num = int(v.split(":")[1])
+            self._value = num
+            view = getattr(self, "view", None)
+            if view is not None:
+                view.choices.setdefault(self.set_idx, {"A": None, "B": None})
+                view.choices[self.set_idx][self.side] = num
+            await self._to_range(interaction)
+            return
+
+class PointsScorePagerView(discord.ui.View):
+    def __init__(self, target:int, cap:int|None, on_submit):
+        super().__init__(timeout=180)
+        self.target, self.cap, self.on_submit = target, cap, on_submit
+        self.choices = {1: {"A": None, "B": None}, 2: {"A": None, "B": None}, 3: {"A": None, "B": None}}
+        self.page = 1
+        self._render()
+
+    def _complete_sets_count(self) -> int:
+        return sum(1 for i in (1,2,3) if self.choices[i]["A"] is not None and self.choices[i]["B"] is not None)
+
+    def _render(self):
+        self.clear_items()
+        s = self.page
+        self.add_item(NumberPicker(s, "A", self.target, self.cap, value=self.choices[s]["A"], row=0))
+        self.add_item(NumberPicker(s, "B", self.target, self.cap, value=self.choices[s]["B"], row=1))
+        # nav row
+        if self.page > 1:
+            back = discord.ui.Button(label="◀ Back", style=discord.ButtonStyle.secondary, row=2)
+            async def _back(interaction:discord.Interaction):
+                self.page -= 1
+                self._render()
+                await interaction.response.edit_message(view=self)
+            back.callback = _back
+            self.add_item(back)
+        if self.page < 3:
+            nxt = discord.ui.Button(label="Next ▶", style=discord.ButtonStyle.primary, row=2)
+            async def _next(interaction:discord.Interaction):
+                self.page += 1
+                self._render()
+                await interaction.response.edit_message(view=self)
+            nxt.callback = _next
+            self.add_item(nxt)
+        else:
+            submit = discord.ui.Button(label="Submit", style=discord.ButtonStyle.success, row=2)
+            async def _submit(interaction:discord.Interaction):
+                if self._complete_sets_count() < 2:
+                    return await interaction.response.send_message("Please enter scores for at least **two** sets.", ephemeral=True)
+                sets = []
+                for idx in (1,2,3):
+                    a, b = self.choices[idx]["A"], self.choices[idx]["B"]
+                    if a is not None and b is not None:
+                        sets.append({"A": int(a), "B": int(b)})
+                await self.on_submit(interaction, sets)
+            submit.callback = _submit
+            self.add_item(submit)
 def gen_standard_scores(target: int):
     # A wins normal: target–0 .. target–(target-11)
     std = []
@@ -87,10 +202,18 @@ class SetScoreSelect(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction):
         v = self.values[0]
         if v.startswith("DEUCE:"):
-            await self.view.show_deuce_for(self.set_idx, interaction)
+            view = getattr(self, "view", None)
+            if view is not None and hasattr(view, "show_deuce_for"):
+                await view.show_deuce_for(self.set_idx, interaction)
+            else:
+                await interaction.response.defer()
             return
-        self.view.store_choice(v)
-        await interaction.response.edit_message(view=self.view)
+        view = getattr(self, "view", None)
+        if view is not None and hasattr(view, "store_choice"):
+            view.store_choice(v)
+            await interaction.response.edit_message(view=view)
+        else:
+            await interaction.response.defer()
 
 
 class DeuceScoreSelect(discord.ui.Select):
@@ -105,8 +228,12 @@ class DeuceScoreSelect(discord.ui.Select):
         super().__init__(placeholder=f"Set {set_idx} deuce score", min_values=1, max_values=1, options=opts)
 
     async def callback(self, interaction: discord.Interaction):
-        self.view.store_choice(self.values[0])
-        await self.view.show_standard(interaction)  # go back to main view
+        view = getattr(self, "view", None)
+        if view is not None and hasattr(view, "store_choice") and hasattr(view, "show_standard"):
+            view.store_choice(self.values[0])
+            await view.show_standard(interaction)  # go back to main view
+        else:
+            await interaction.response.defer()
 
 
 class ScoreSelectView(discord.ui.View):
