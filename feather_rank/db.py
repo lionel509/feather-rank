@@ -286,14 +286,14 @@ async def table_has_column(table: str, column: str, db_path: str = "feather_rank
 DB_PATH = "feather_rank.db"
 
 async def init_db(db_path: str = "feather_rank.db"):
-        # Add status column to scoreboards if missing
-        if not await table_has_column("scoreboards", "status", DB_PATH):
-            await db.execute("ALTER TABLE scoreboards ADD COLUMN status TEXT")
     """Initialize the database with required tables and columns."""
     global DB_PATH
     DB_PATH = db_path
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # Add status column to scoreboards if missing
+        if not await table_has_column("scoreboards", "status", DB_PATH):
+            await db.execute("ALTER TABLE scoreboards ADD COLUMN status TEXT")
         # Add serve_side column to scoreboards if missing
         if not await table_has_column("scoreboards", "serve_side", DB_PATH):
             await db.execute("ALTER TABLE scoreboards ADD COLUMN serve_side TEXT")
