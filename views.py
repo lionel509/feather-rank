@@ -1,3 +1,49 @@
+import discord
+
+def point_options(target:int, cap:int|None) -> list[discord.SelectOption]:
+    hi = cap or (30 if target >= 21 else 15)
+    return [discord.SelectOption(label=str(i), value=str(i)) for i in range(0, hi+1)]
+
+class PointsSelect(discord.ui.Select):
+    def __init__(self, set_idx:int, side:str, target:int, cap:int|None):
+        self.set_idx, self.side = set_idx, side  # side: "A" or "B"
+        opts = point_options(target, cap)
+        ph = f"Set {set_idx} — {('A' if side=='A' else 'B')} points"
+        super().__init__(placeholder=ph, min_values=1, max_values=1, options=opts)
+
+    async def callback(self, interaction: discord.Interaction):
+        self.view.choices.setdefault(self.set_idx, {"A": None, "B": None})
+        self.view.choices[self.set_idx][self.side] = int(self.values[0])
+        await interaction.response.defer()
+
+class PointsScoreView(discord.ui.View):
+    def __init__(self, target:int, cap:int|None, on_submit):
+        super().__init__(timeout=120)
+        self.target, self.cap, self.on_submit = target, cap, on_submit
+        self.choices: dict[int, dict[str,int|None]] = {}
+        # 6 boxes: (S1A,S1B, S2A,S2B, S3A,S3B)
+        for s in (1,2,3):
+            self.add_item(PointsSelect(s, "A", target, cap))
+            self.add_item(PointsSelect(s, "B", target, cap))
+
+    def _sets_filled_min2(self) -> bool:
+        done = 0
+        for s in (1,2,3):
+            v = self.choices.get(s)
+            if v and v.get("A") is not None and v.get("B") is not None:
+                done += 1
+        return done >= 2
+
+    @discord.ui.button(label="Submit", style=discord.ButtonStyle.success)
+    async def submit(self, _, interaction: discord.Interaction):
+        if not self._sets_filled_min2():
+            return await interaction.response.send_message("Please select scores for at least **two** sets.", ephemeral=True)
+        sets = []
+        for i in (1,2,3):
+            v = self.choices.get(i)
+            if v and v.get("A") is not None and v.get("B") is not None:
+                sets.append({"A": int(v["A"]), "B": int(v["B"])});
+        await self.on_submit(interaction, sets)
 def gen_standard_scores(target: int):
     # A wins normal: target–0 .. target–(target-11)
     std = []

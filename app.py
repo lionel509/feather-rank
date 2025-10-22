@@ -1,3 +1,53 @@
+# Debug: print number of player rows if leaderboard is empty
+async def print_player_row_count(conn):
+    cnt = await (await conn.execute("SELECT COUNT(*) c FROM players")).fetchone()
+    print("players rows:", cnt["c"])
+@tree.command(name="leaderboard", description="Show top players by rating")
+@app_commands.describe(limit="How many players to show (1-50)")
+async def leaderboard(inter: discord.Interaction, limit: app_commands.Range[int, 1, 50] = 20):
+    n = int(limit)  # do NOT coerce to 0; keep default 20
+    rows = await db.top_players(getattr(inter.guild, "id", None), n)
+    if not rows:
+        return await inter.response.send_message("No players found yet.", ephemeral=True)
+
+    # readable output using mentions + names
+    lines = [f"**🏆 Leaderboard (Top {n})**"]
+    for i, r in enumerate(rows, start=1):
+        uid, name, rating, w, l = r["user_id"], r["username"], r["rating"], r["wins"], r["losses"]
+        mention = f"<@{uid}>"
+        lines.append(f"{i}. {mention} — {name} — {rating:.1f} ({w}-{l})")
+    await inter.response.send_message("\n".join(lines), allowed_mentions=ALLOWED_MENTIONS)
+from views import PointsScoreView
+from rules import match_winner
+
+@tree.command(name="match_singles", description="Report singles match (players, then select scores)")
+@app_commands.describe(a="Player A", b="Player B", target="Target points (11 or 21)")
+@app_commands.choices(target=[
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
+])
+async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.User, target: int = 21):
+    cap = 30 if target >= 21 else 15  # or your derive_cap()
+
+    async def on_submit(i2: discord.Interaction, set_scores: list[dict]):
+        try:
+            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
+        except Exception as e:
+            return await i2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
+
+        mid = await db.insert_pending_match_points(
+            guild_id=inter.guild.id, mode="singles",
+            team_a=[a.id], team_b=[b.id],
+            set_scores=set_scores, reporter=inter.user.id
+        )
+        await notify_verification(mid)
+        await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+
+    view = PointsScoreView(target=target, cap=cap, on_submit=on_submit)
+    await inter.response.send_message(
+        content=f"Select set scores for {a.mention} vs {b.mention} (to {target}, win by 2).",
+        view=view, ephemeral=True, allowed_mentions=ALLOWED_MENTIONS
+    )
 from feather_rank.rules import valid_set, match_winner
 import json
 import fmt

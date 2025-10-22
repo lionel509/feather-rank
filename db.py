@@ -1,3 +1,20 @@
+async def top_players(guild_id:int|None, limit:int=20):
+    # If your schema is per-guild in players table:
+    try:
+        cur = await conn.execute(
+            "SELECT user_id, username, rating, wins, losses FROM players "
+            + ("WHERE guild_id=? " if guild_id is not None else "")
+            + "ORDER BY rating DESC LIMIT ?",
+            ((guild_id, limit) if guild_id is not None else (limit,))
+        )
+        return await cur.fetchall()
+    except Exception:
+        # Fallback: no guild_id column; show global top
+        cur = await conn.execute(
+            "SELECT user_id, username, rating, wins, losses FROM players ORDER BY rating DESC LIMIT ?",
+            (limit,)
+        )
+        return await cur.fetchall()
 """Shim module for backward compatibility.
 
 This top-level module forwards imports to the packaged implementation in
