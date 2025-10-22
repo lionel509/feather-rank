@@ -747,13 +747,20 @@ async def create_scoreboard(
 
 
 async def get_scoreboard_by_message(message_id: int) -> dict | None:
-    """Get scoreboard by message_id."""
+    """Get scoreboard + message mapping by message_id.
+
+    Returns a dict including at least:
+    - scoreboard_id
+    - set_no
+    - all columns from scoreboards (id, guild_id, ...)
+    """
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             """
-            SELECT s.* FROM scoreboards s
-            JOIN scoreboard_messages sm ON s.id = sm.scoreboard_id
+            SELECT s.*, sm.scoreboard_id AS scoreboard_id, sm.set_no AS set_no
+            FROM scoreboard_messages sm
+            JOIN scoreboards s ON s.id = sm.scoreboard_id
             WHERE sm.message_id = ?
             """,
             (message_id,)

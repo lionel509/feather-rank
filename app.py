@@ -36,6 +36,7 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 TEST_MODE = os.getenv("TEST_MODE", "0").lower() in ("1", "true", "yes")
 TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0") or 0) or None
 EPHEMERAL_DB = os.getenv("EPHEMERAL_DB", "0").lower() in ("1", "true", "yes")
+PIN_SCOREBOARD = os.getenv("PIN_SCOREBOARD", "0").lower() in ("1","true","yes")
 
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
 
@@ -84,6 +85,15 @@ tree = app_commands.CommandTree(bot)
 guild_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
 def get_guild_lock(guild_id: int | None) -> asyncio.Lock:
     return guild_locks[guild_id or 0]
+
+# Concurrency guard for scoreboard updates (per-scoreboard locks)
+_scoreboard_locks: dict[int, asyncio.Lock] = {}
+def sb_lock(sb_id: int) -> asyncio.Lock:
+    lock = _scoreboard_locks.get(sb_id)
+    if not lock:
+        lock = asyncio.Lock()
+        _scoreboard_locks[sb_id] = lock
+    return lock
 
 # ToS text
 TOS_TEXT = (
@@ -155,10 +165,16 @@ async def post_scoreboard_message(inter: discord.Interaction, scoreboard_id: int
         except Exception:
             pass
     await db.record_sb_message(m.id, scoreboard_id, set_no)
+    # Never pin; optionally unpin if someone pinned it
+    try:
+        if getattr(m, "pinned", False) and not PIN_SCOREBOARD:
+            await m.unpin(reason="Scoreboard: pin disabled")
+    except Exception:
+        pass
     return m
 
 async def edit_scoreboard_message(message: discord.Message, scoreboard_id: int, set_no: int) -> None:
-    """Edit an existing scoreboard message with updated scores."""
+    """Edit an existing scoreboard message with updated scores (no pin)."""
     sb = await db.get_scoreboard(scoreboard_id)
     s = await db.get_set(scoreboard_id, set_no)
     guild = message.guild
@@ -180,7 +196,62 @@ async def edit_scoreboard_message(message: discord.Message, scoreboard_id: int, 
         f"{EMOJI_DONE} finalize · {EMOJI_NEXT} next-set · {EMOJI_SERVE} toggle serve"
     )
 
-    await message.edit(content=content)
+    await message.edit(content=content, allowed_mentions=ALLOWED_MENTIONS)
+    # Never pin; optionally unpin if pinned
+    try:
+        if getattr(message, "pinned", False) and not PIN_SCOREBOARD:
+            await message.unpin(reason="Scoreboard: pin disabled")
+    except Exception:
+        pass
+
+async def ensure_set_row(scoreboard_id: int, set_no: int):
+    row = await db.get_set(scoreboard_id, set_no)
+    if not row:
+        await db.upsert_set(scoreboard_id, set_no, 0, 0, None)
+
+async def _advance_if_needed(payload, msg: discord.Message, sb: dict, sb_msg_row: dict) -> bool:
+    """Advance to next set or finalize match if current set is finished.
+
+    Returns True if we advanced (new message posted) or finalized, else False.
+    """
+    s = await db.get_set(sb["id"], sb_msg_row["set_no"])
+    if s:
+        a, b = int(s["a_points"]), int(s["b_points"])
+    else:
+        a, b = 0, 0
+    done, winner = set_finished(a, b, sb["target_points"], win_by=2, cap=sb.get("cap_points"))
+    if not done:
+        return False
+
+    # Close current set with winner
+    await db.upsert_set(sb["id"], sb_msg_row["set_no"], a, b, winner)
+
+    # Count wins across sets 1..3
+    sets = []
+    for i in (1, 2, 3):
+        row = await db.get_set(sb["id"], i)
+        if row:
+            sets.append(row)
+    wins_a = sum(1 for x in sets if (x.get("winner") == "A"))
+    wins_b = sum(1 for x in sets if (x.get("winner") == "B"))
+
+    # Match over?
+    if wins_a == 2 or wins_b == 2:
+        await finalize_scoreboard_match(sb["id"])  # creates pending match + notify
+        return True
+
+    # Otherwise start next set
+    next_no = max(x["set_no"] for x in sets) + 1 if len(sets) < 3 else None
+    if next_no:
+        await ensure_set_row(sb["id"], next_no)
+        ch = await bot.fetch_channel(payload.channel_id)
+        class _Inter:
+            guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+            channel = ch
+        await post_scoreboard_message(_Inter(), sb["id"], set_no=next_no)
+        return True
+
+    return False
 
 async def finalize_scoreboard_match(scoreboard_id: int) -> None:
     """Finalize a scoreboard match and create a verified match record."""
@@ -297,125 +368,72 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
         return
 
     # SCOREBOARD BRANCH
-    sb_row = await db.get_scoreboard_by_message(payload.message_id)
-    if sb_row:
-        guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
-        channel = await bot.fetch_channel(payload.channel_id)
-        msg = await channel.fetch_message(payload.message_id)
-        member = None
-        try:
-            member = payload.member or (guild and guild.get_member(payload.user_id))
-        except Exception:
-            pass
+    sb_msg_row = await db.get_scoreboard_by_message(payload.message_id)
+    if sb_msg_row:
+        async with sb_lock(sb_msg_row["scoreboard_id"]):
+            guild = bot.get_guild(payload.guild_id) if payload.guild_id else None
+            ch = await bot.fetch_channel(payload.channel_id)
+            msg = await ch.fetch_message(payload.message_id)
 
-        # Only referee (or admins) may press
-        sb = await db.get_scoreboard(sb_row["id"])
-        if payload.user_id != sb["referee_id"]:
-            # (optional) silently remove reaction for others
+            sb = await db.get_scoreboard(sb_msg_row["scoreboard_id"])  # authoritative
+            # Only referee can press
+            if payload.user_id != sb["referee_id"]:
+                try:
+                    await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+                except Exception:
+                    pass
+                return
+
+            # UX: remove the reaction the ref just tapped
             try:
-                await msg.remove_reaction(payload.emoji, discord.Object(id=payload.user_id))
+                await msg.remove_reaction(payload.emoji, payload.member or discord.Object(id=payload.user_id))
             except Exception:
                 pass
-            return
 
-        emoji = str(payload.emoji)
+            emoji = str(payload.emoji)
+            s = await db.get_set(sb["id"], sb_msg_row["set_no"])
+            if s:
+                a, b = int(s["a_points"]), int(s["b_points"])
+            else:
+                a, b = 0, 0
+            changed = False
 
-        # Remove the pressed reaction (UX: one tap)
-        try:
-            await msg.remove_reaction(payload.emoji, member or discord.Object(id=payload.user_id))
-        except Exception:
-            pass
-
-        # Load set scores
-        set_no = getattr(payload, "set_no", 1)  # fallback to 1 if not present
-        s = await db.get_set(sb["id"], set_no)
-        a, b = int(s["a_points"]), int(s["b_points"])
-
-        changed = False
-        if emoji == EMOJI_A_PLUS:
-            a += 1
-            changed = True
-            await db.record_play(sb["id"], set_no, "A", +1)
-            await db.set_serve_side(sb["id"], "A")
-        elif emoji == EMOJI_B_PLUS:
-            b += 1
-            changed = True
-            await db.record_play(sb["id"], set_no, "B", +1)
-            await db.set_serve_side(sb["id"], "B")
-        elif emoji == EMOJI_UNDO:
-            lp = await db.last_play(sb["id"], set_no)
-            if lp:
-                if lp["side"] == "A":
-                    a = max(0, a - 1)
-                else:
-                    b = max(0, b - 1)
-                await db.delete_last_play(sb["id"], set_no)
-                changed = True
-        elif emoji == EMOJI_SERVE:
-            current_serve = sb.get("serve_side")
-            new_serve = "B" if current_serve == "A" else "A"
-            await db.set_serve_side(sb["id"], new_serve)
-        elif emoji == EMOJI_NEXT:
-            # force next set if current finished (or admin override)
-            pass
-        elif emoji == EMOJI_DONE:
-            # finalize early: mark complete using current sets
-            await finalize_scoreboard_match(sb["id"])
-            return
-
-        # Persist
-        if changed:
-            await db.upsert_set(sb["id"], set_no, a, b, None)
-
-        # Check set winner
-        finished, winner = set_finished(a, b, sb["target_points"], win_by=2, cap=sb["cap_points"])
-        if finished and winner:
-            await db.upsert_set(sb["id"], set_no, a, b, winner)
-
-            # Append "✅ Set {n} to {A/B}" to the current message
-            try:
-                current_content = msg.content
-                completion_text = f"\n\n✅ **Set {sb_row['set_no']} to Team {winner}**"
-                await msg.edit(content=current_content + completion_text)
-            except Exception as e:
-                log.warning("Failed to append set completion to message: %s", e)
-
-            # If set 1 done -> create set 2 message
-            # If set 2 leads to 1-1 -> create set 3 message
-            # Else if someone leads 2-0 -> finalize match
-            sets = [await db.get_set(sb["id"], i) for i in (1, 2, 3) if await db.get_set(sb["id"], i)]
-            wins_a = sum(1 for x in sets if x.get("winner") == "A")
-            wins_b = sum(1 for x in sets if x.get("winner") == "B")
-
-            if wins_a == 2 or wins_b == 2:
+            if emoji == EMOJI_A_PLUS:
+                a += 1; changed = True
+                await db.record_play(sb["id"], sb_msg_row["set_no"], "A", +1)
+                await db.set_serve_side(sb["id"], "A")
+            elif emoji == EMOJI_B_PLUS:
+                b += 1; changed = True
+                await db.record_play(sb["id"], sb_msg_row["set_no"], "B", +1)
+                await db.set_serve_side(sb["id"], "B")
+            elif emoji == EMOJI_UNDO:
+                lp = await db.last_play(sb["id"], sb_msg_row["set_no"])
+                if lp:
+                    if lp["side"] == "A": a = max(0, a-1)
+                    else: b = max(0, b-1)
+                    await db.delete_last_play(sb["id"], sb_msg_row["set_no"])
+                    changed = True
+            elif emoji == EMOJI_SERVE:
+                current = sb.get("serve_side")
+                await db.set_serve_side(sb["id"], ("B" if current == "A" else "A"))
+            elif emoji == EMOJI_NEXT:
+                # force next handled by advance if current finished
+                pass
+            elif emoji == EMOJI_DONE:
                 await finalize_scoreboard_match(sb["id"])
                 return
 
-            next_set_no = max(x["set_no"] for x in sets) + 1 if len(sets) < 3 else None
-            if next_set_no:
-                # Post next set message
-                await db.upsert_set(sb["id"], next_set_no, 0, 0, None)
-                # reuse author interaction is not available; fetch a channel context:
-                ch = await bot.fetch_channel(payload.channel_id)
+            if changed:
+                await db.upsert_set(sb["id"], sb_msg_row["set_no"], a, b, None)
 
-                class FakeInter:
-                    def __init__(self):
-                        self.guild = guild
-                        self.channel = ch
-
-                new_msg = await post_scoreboard_message(FakeInter(), sb["id"], next_set_no)
-                
-                # Pin the active set message (optional)
-                try:
-                    await new_msg.pin()
-                except Exception as e:
-                    log.debug("Failed to pin scoreboard message: %s", e)
-                
+            # Advance or finalize if set complete
+            advanced_or_final = await _advance_if_needed(payload, msg, sb, sb_msg_row)
+            if advanced_or_final:
                 return
 
-        # Otherwise, just update the current message
-        await edit_scoreboard_message(msg, sb["id"], set_no)
-        return
+            # Otherwise update inline (no pin)
+            await edit_scoreboard_message(msg, sb["id"], sb_msg_row["set_no"])
+            return
 
     # VERIFICATION BRANCH - fall through to existing verification reactions (✅/❌)
     row = await db.get_verification_message(payload.message_id)
