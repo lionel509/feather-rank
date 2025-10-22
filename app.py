@@ -160,89 +160,70 @@ async def agree_tos(inter: discord.Interaction, name: str):
     )
     log.info("User %s accepted ToS with name", inter.user.id)
 
-@tree.command(name="match_doubles", description="Record a 2v2 badminton match")
+@tree.command(name="match_doubles", description="Record a 2v2 badminton match (pick players, then select scores)")
 @app_commands.describe(
     a1="Team A - Player 1",
     a2="Team A - Player 2",
     b1="Team B - Player 1",
     b2="Team B - Player 2",
-    s1a="Set 1: points for A",
-    s1b="Set 1: points for B",
-    s2a="Set 2: points for A",
-    s2b="Set 2: points for B",
-    s3a="Set 3: points for A (optional)",
-    s3b="Set 3: points for B (optional)",
-    target="Target points per set (default: 21)"
+    target="Target points (11 or 21)"
 )
 @app_commands.choices(target=[
-    app_commands.Choice(name="11 points", value=11),
-    app_commands.Choice(name="21 points", value=21)
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
 ])
 async def match_doubles(
-    interaction: discord.Interaction,
+    inter: discord.Interaction,
     a1: discord.User,
     a2: discord.User,
     b1: discord.User,
     b2: discord.User,
-    s1a: int,
-    s1b: int,
-    s2a: int,
-    s2b: int,
-    s3a: int | None = None,
-    s3b: int | None = None,
-    target: int = POINTS_TARGET_DEFAULT
+    target: int = 21
 ):
-    if not await require_tos(interaction):
+    from views import ScoreSelectView
+    
+    if not await require_tos(inter):
         return
-    await interaction.response.defer(ephemeral=True)
+    
     all_players = [a1.id, a2.id, b1.id, b2.id]
     if len(set(all_players)) != 4:
-        await interaction.followup.send("❌ All four players must be different.", ephemeral=True)
+        await inter.response.send_message("❌ All four players must be different.", ephemeral=True)
         return
-    # Build set_scores from s1*, s2*, s3*
-    set_scores = [
-        {"A": s1a, "B": s1b},
-        {"A": s2a, "B": s2b}
-    ]
-    if s3a is not None and s3b is not None:
-        set_scores.append({"A": s3a, "B": s3b})
-    # Validate each set
-    cap = derive_cap(target)
-    for i, s in enumerate(set_scores):
-        if not valid_set(s["A"], s["B"], target, POINTS_WIN_BY, cap):
-            await interaction.followup.send(f"❌ Set {i+1} is not valid.", ephemeral=True)
-            return
-    # Compute winner and points
-    winner, sets_a, sets_b, pts_a, pts_b = match_winner(set_scores, target, POINTS_WIN_BY, cap)
-    if not winner:
-        await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
-        return
-    guild_id = interaction.guild_id or 0
-    try:
-        async with get_guild_lock(guild_id):
-            match_id = await insert_pending_match_points(
-                guild_id=guild_id,
-                mode="2v2",
-                team_a=[a1.id, a2.id],
-                team_b=[b1.id, b2.id],
-                set_scores=set_scores,
-                reporter=interaction.user.id,
-                target_points=target
-            )
+    
+    cap = 30 if target >= 21 else 15
+
+    async def on_submit(inter2: discord.Interaction, set_scores: list[dict]):
+        # Validate & finish
+        from feather_rank.rules import match_winner
+        try:
+            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
+        except Exception as e:
+            return await inter2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
+
+        # persist as PENDING + verification
+        match_id = await db.insert_pending_match_points(
+            guild_id=inter.guild_id or 0,
+            mode="2v2",
+            team_a=[a1.id, a2.id],
+            team_b=[b1.id, b2.id],
+            set_scores=set_scores,
+            reporter=inter.user.id,
+            target_points=target
+        )
         await notify_verification(match_id)
-        # Build compact summary
-        def disp(u: discord.User) -> str:
-            return getattr(u, 'display_name', None) or u.name
-        title = fmt.bold(f"Match #{match_id} — Pending Verification")
-        teams = f"{disp(a1)}/{disp(a2)} vs {disp(b1)}/{disp(b2)}"
-        format_line = f"Best-of-3 to {target} (win by {POINTS_WIN_BY})"
-        sets_line = fmt.score_sets(set_scores)
-        help_line = "Use " + fmt.code("/verify") + " to approve or " + fmt.code('/verify decision:reject') + " to reject."
-        msg = f"{title}\n{teams}\n{format_line}\n{sets_line}\n{help_line}"
-        await interaction.followup.send(msg, ephemeral=True)
-    except Exception as e:
-        log.exception("Failed to create match for user=%s", interaction.user.id)
-        await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
+        await inter2.response.edit_message(content=f"Match #{match_id} created. Waiting for approvals.", view=None)
+
+    view = ScoreSelectView(target=target, cap=cap, on_submit=on_submit)
+    
+    def disp(u: discord.User) -> str:
+        return getattr(u, 'display_name', None) or u.name
+    
+    await inter.response.send_message(
+        content=f"Select set scores for {disp(a1)}/{disp(a2)} vs {disp(b1)}/{disp(b2)} (to {target}, win by 2).",
+        view=view,
+        ephemeral=True,
+        allowed_mentions=ALLOWED_MENTIONS
+    )
 
 # --- Doubles match with points ---
 @tree.command(name="match_doubles_points", description="Record a 2v2 badminton match (point-based)")
@@ -329,85 +310,49 @@ async def match_doubles_points(
         log.exception("Failed to create match for user=%s", interaction.user.id)
         await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
 
-# --- Singles match with points ---
-@tree.command(name="match_singles", description="Record a 1v1 badminton match (point-based)")
-@app_commands.describe(
-    a="Player A",
-    b="Player B",
-    s1a="Set 1: points for A",
-    s1b="Set 1: points for B",
-    s2a="Set 2: points for A",
-    s2b="Set 2: points for B",
-    s3a="Set 3: points for A (optional)",
-    s3b="Set 3: points for B (optional)",
-    target="Target points per set (default: 21)"
-)
+# --- Singles match with dropdown score selection ---
+@tree.command(name="match_singles", description="Report a singles match (pick players, then select scores)")
+@app_commands.describe(a="Player A", b="Player B", target="Target points (11 or 21)")
 @app_commands.choices(target=[
-    app_commands.Choice(name="11 points", value=11),
-    app_commands.Choice(name="21 points", value=21)
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
 ])
-async def match_singles(
-    interaction: discord.Interaction,
-    a: discord.User,
-    b: discord.User,
-    s1a: int,
-    s1b: int,
-    s2a: int,
-    s2b: int,
-    s3a: int | None = None,
-    s3b: int | None = None,
-    target: int = POINTS_TARGET_DEFAULT
-):
-    if not await require_tos(interaction):
+async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.User, target: int = 21):
+    from views import ScoreSelectView
+    
+    if not await require_tos(inter):
         return
-    await interaction.response.defer(ephemeral=True)
-    if a.id == b.id:
-        await interaction.followup.send("❌ Players must be different.", ephemeral=True)
-        return
-    # Build set_scores from s1*, s2*, s3*
-    set_scores = [
-        {"A": s1a, "B": s1b},
-        {"A": s2a, "B": s2b}
-    ]
-    if s3a is not None and s3b is not None:
-        set_scores.append({"A": s3a, "B": s3b})
-    # Validate each set
-    cap = derive_cap(target)
-    for i, s in enumerate(set_scores):
-        if not valid_set(s["A"], s["B"], target, POINTS_WIN_BY, cap):
-            await interaction.followup.send(f"❌ Set {i+1} is not valid.", ephemeral=True)
-            return
-    # Compute winner and points
-    winner, sets_a, sets_b, pts_a, pts_b = match_winner(set_scores, target, POINTS_WIN_BY, cap)
-    if not winner:
-        await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
-        return
-    guild_id = interaction.guild_id or 0
-    try:
-        async with get_guild_lock(guild_id):
-            match_id = await insert_pending_match_points(
-                guild_id=guild_id,
-                mode="1v1",
-                team_a=[a.id],
-                team_b=[b.id],
-                set_scores=set_scores,
-                reporter=interaction.user.id,
-                target_points=target
-            )
-        await notify_verification(match_id)
-        # Build compact summary
-        def disp(u: discord.User) -> str:
-            return getattr(u, 'display_name', None) or u.name
-        title = fmt.bold(f"Match #{match_id} — Pending Verification")
-        teams = f"{disp(a)} vs {disp(b)}"
-        format_line = f"Best-of-3 to {target} (win by {POINTS_WIN_BY})"
-        sets_line = fmt.score_sets(set_scores)
-        help_line = "Use " + fmt.code("/verify") + " to approve or " + fmt.code('/verify decision:reject') + " to reject."
-        msg = f"{title}\n{teams}\n{format_line}\n{sets_line}\n{help_line}"
-        await interaction.followup.send(msg, ephemeral=True)
-    except Exception as e:
-        log.exception("Failed to create match for user=%s", interaction.user.id)
-        await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
+    
+    cap = 30 if target >= 21 else 15  # override with your derive_cap() if you have it
+
+    async def on_submit(inter2: discord.Interaction, set_scores: list[dict]):
+        # Validate & finish (reuse your rules + pending + notify)
+        from feather_rank.rules import match_winner
+        try:
+            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
+        except Exception as e:
+            return await inter2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
+
+        # persist as PENDING + verification
+        match_id = await db.insert_pending_match_points(
+            guild_id=inter.guild_id or 0,
+            mode="singles",
+            team_a=[a.id],
+            team_b=[b.id],
+            set_scores=set_scores,
+            reporter=inter.user.id,
+            target_points=target
+        )
+        await notify_verification(match_id)  # your existing function
+        await inter2.response.edit_message(content=f"Match #{match_id} created. Waiting for approvals.", view=None)
+
+    view = ScoreSelectView(target=target, cap=cap, on_submit=on_submit)
+    await inter.response.send_message(
+        content=f"Select set scores for {a.mention} vs {b.mention} (to {target}, win by 2).",
+        view=view,
+        ephemeral=True,
+        allowed_mentions=ALLOWED_MENTIONS
+    )
 
 @tree.command(name="leaderboard", description="Show the top players by rating")
 @app_commands.describe(limit="Number of players to show (default: 20)")
