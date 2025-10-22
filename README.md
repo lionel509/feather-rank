@@ -40,6 +40,50 @@
 
 Track 1v1 and 2v2 badminton matches right inside Discord. Pick players with User Select menus, report set winners or points, and auto-update ratings with a configurable Elo (or Glicko-2) system. View leaderboards, player cards, and match history, all powered by slash/context commands and interactive components.
 
+## Scoring Rules
+
+Matches are played **best-of-3 sets**. Each set follows badminton rally point scoring:
+
+- **Default**: Play to **21 points** (win by 2, capped at 30)
+- **Alternative**: Play to **11 points** (win by 2, capped at 15)
+
+When reporting a match via `/match_singles` or `/match_doubles`, you can choose the `target` option:
+
+- `21 points` (default) — Standard badminton scoring
+- `11 points` — Short format
+
+### Rules Details
+
+- A set is won by reaching the target score with at least a 2-point lead
+- If the score reaches the cap (30 for 21-point games, 15 for 11-point games), the next point wins
+- Examples for 11-point games:
+  - **11-9**: Valid (reached 11 with 2+ point lead)
+  - **13-11**: Valid (2-point lead maintained)
+  - **15-14**: Valid (cap reached, next point wins)
+  - **11-10**: Invalid (only 1-point lead)
+
+### Environment Variable Overrides
+
+You can customize scoring rules via environment variables:
+
+```bash
+# Set default target (21 or 11)
+POINTS_TARGET_DEFAULT=21
+
+# Set win-by margin (default: 2)
+POINTS_WIN_BY=2
+
+# Override cap calculation (default: 30 for 21pt, 15 for 11pt)
+POINTS_CAP=30
+
+# Set POINTS_CAP to empty or omit to disable cap entirely
+```
+
+When `POINTS_CAP` is not set, the cap is automatically derived:
+
+- 21-point games → cap at 30
+- 11-point games → cap at 15
+
 ## Logging
 
 This project now has centralized logging with two modes:

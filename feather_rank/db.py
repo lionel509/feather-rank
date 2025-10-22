@@ -9,7 +9,8 @@ async def insert_pending_match_points(
     team_a: list[int],
     team_b: list[int],
     set_scores: list[dict],
-    reporter: int
+    reporter: int,
+    target_points: int = 21
 ) -> int:
     """Insert a pending match with set_scores and points columns, return its ID."""
     async with aiosqlite.connect(DB_PATH) as db:
@@ -20,10 +21,10 @@ async def insert_pending_match_points(
         try:
             cursor = await db.execute(
                 """
-                INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b, set_winners, winner)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, NULL, NULL)
+                INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b, set_winners, winner, target_points)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, NULL, NULL, ?)
                 """,
-                (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter)
+                (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter, target_points)
             )
             await db.commit()
         except aiosqlite.OperationalError as e:
@@ -32,16 +33,16 @@ async def insert_pending_match_points(
                 await init_db(DB_PATH)
                 cursor = await db.execute(
                     """
-                    INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b, set_winners, winner)
-                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, NULL, NULL)
+                    INSERT INTO matches (guild_id, mode, team_a, team_b, set_scores, created_at, status, reporter, created_by, points_a, points_b, set_winners, winner, target_points)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, 0, 0, NULL, NULL, ?)
                     """,
-                    (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter)
+                    (guild_id, mode, team_a_str, team_b_str, set_scores_str, now, reporter, reporter, target_points)
                 )
                 await db.commit()
             else:
                 raise
     match_id = cursor.lastrowid if cursor.lastrowid is not None else -1
-    log.debug("Inserted pending points match id=%s guild=%s mode=%s A=%s B=%s", match_id, guild_id, mode, team_a_str, team_b_str)
+    log.debug("Inserted pending points match id=%s guild=%s mode=%s A=%s B=%s target=%s", match_id, guild_id, mode, team_a_str, team_b_str, target_points)
     return match_id
 
 async def finalize_points(
@@ -330,6 +331,14 @@ async def init_db(db_path: str = "feather_rank.db"):
         # points_b INT DEFAULT 0
         if not await table_has_column("matches", "points_b", DB_PATH):
             await db.execute("ALTER TABLE matches ADD COLUMN points_b INTEGER NOT NULL DEFAULT 0")
+        # target_points INT DEFAULT 21
+        if not await table_has_column("matches", "target_points", DB_PATH):
+            try:
+                await db.execute("ALTER TABLE matches ADD COLUMN target_points INTEGER DEFAULT 21")
+            except aiosqlite.OperationalError as e:
+                # Ignore duplicate column errors
+                if "duplicate column" not in str(e).lower():
+                    raise
         
         # Migrate existing tables: make set_winners and winner nullable for point-based matches
         # SQLite doesn't support ALTER COLUMN, so we check if recreation is needed

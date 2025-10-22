@@ -49,9 +49,15 @@ DATABASE_PATH = os.getenv(
 if EPHEMERAL_DB:
     DATABASE_PATH = "file::memory:?cache=shared"
 # Point-based match rules
-POINTS_TARGET = int(os.getenv("POINTS_TARGET", "21"))
+POINTS_TARGET_DEFAULT = int(os.getenv("POINTS_TARGET_DEFAULT", "21"))
 POINTS_WIN_BY = int(os.getenv("POINTS_WIN_BY", "2"))
-POINTS_CAP = int(os.getenv("POINTS_CAP", "30"))
+# If POINTS_CAP is unset, derive: 30 for 21-point games; 15 for 11-point games.
+POINTS_CAP_ENV = os.getenv("POINTS_CAP")
+
+def derive_cap(target: int) -> int | None:
+    if POINTS_CAP_ENV is not None:
+        return int(POINTS_CAP_ENV)
+    return 30 if target >= 21 else 15
 
 # Guild-based locks for database writes
 guild_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -154,67 +160,70 @@ async def agree_tos(inter: discord.Interaction, name: str):
     )
     log.info("User %s accepted ToS with name", inter.user.id)
 
-@tree.command(name="match_doubles", description="Record a 2v2 badminton match")
+@tree.command(name="match_doubles", description="Record a 2v2 badminton match (pick players, then select scores)")
 @app_commands.describe(
     a1="Team A - Player 1",
     a2="Team A - Player 2",
     b1="Team B - Player 1",
     b2="Team B - Player 2",
-    set1="Set 1 winner (A or B)",
-    set2="Set 2 winner (A or B)",
-    set3="Set 3 winner (A or B, optional)"
+    target="Target points (11 or 21)"
 )
+@app_commands.choices(target=[
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
+])
 async def match_doubles(
-    interaction: discord.Interaction,
+    inter: discord.Interaction,
     a1: discord.User,
     a2: discord.User,
     b1: discord.User,
     b2: discord.User,
-    set1: str,
-    set2: str,
-    set3: str | None = None
+    target: int = 21
 ):
-    if not await require_tos(interaction):
+    from views import ScoreSelectView
+    
+    if not await require_tos(inter):
         return
-    await interaction.response.defer(ephemeral=True)
-    # Validate set winners
-    valid_winners = {"A", "a", "B", "b"}
-    if set1.upper() not in {"A", "B"} or set2.upper() not in {"A", "B"}:
-        await interaction.followup.send("❌ Set winners must be 'A' or 'B'", ephemeral=True)
-        return
-    if set3 and set3.upper() not in {"A", "B"}:
-        await interaction.followup.send("❌ Set 3 winner must be 'A' or 'B'", ephemeral=True)
-        return
+    
     all_players = [a1.id, a2.id, b1.id, b2.id]
     if len(set(all_players)) != 4:
-        await interaction.followup.send("❌ All four players must be different", ephemeral=True)
+        await inter.response.send_message("❌ All four players must be different.", ephemeral=True)
         return
-    set_winners = [set1.upper(), set2.upper()]
-    if set3:
-        set_winners.append(set3.upper())
-    a_sets = set_winners.count("A")
-    b_sets = set_winners.count("B")
-    if a_sets > b_sets:
-        winner = "A"
-    elif b_sets > a_sets:
-        winner = "B"
-    else:
-        await interaction.followup.send("❌ Invalid match result - no clear winner", ephemeral=True)
-        return
-    guild_id = interaction.guild_id or 0
-    async with get_guild_lock(guild_id):
-        match_id = await insert_pending_match(
-            guild_id=guild_id,
+    
+    cap = 30 if target >= 21 else 15
+
+    async def on_submit(inter2: discord.Interaction, set_scores: list[dict]):
+        # Validate & finish
+        from feather_rank.rules import match_winner
+        try:
+            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
+        except Exception as e:
+            return await inter2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
+
+        # persist as PENDING + verification
+        match_id = await db.insert_pending_match_points(
+            guild_id=inter.guild_id or 0,
             mode="2v2",
             team_a=[a1.id, a2.id],
             team_b=[b1.id, b2.id],
-            set_winners=set_winners,
-            winner=winner,
-            reporter=interaction.user.id
+            set_scores=set_scores,
+            reporter=inter.user.id,
+            target_points=target
         )
-    log.info("Created pending match #%s (2v2) guild=%s reporter=%s", match_id, guild_id, interaction.user.id)
-    await notify_verification(match_id)
-    await interaction.followup.send(f"Match #{match_id} created. Waiting for approvals.", ephemeral=True)
+        await notify_verification(match_id)
+        await inter2.response.edit_message(content=f"Match #{match_id} created. Waiting for approvals.", view=None)
+
+    view = ScoreSelectView(target=target, cap=cap, on_submit=on_submit)
+    
+    def disp(u: discord.User) -> str:
+        return getattr(u, 'display_name', None) or u.name
+    
+    await inter.response.send_message(
+        content=f"Select set scores for {disp(a1)}/{disp(a2)} vs {disp(b1)}/{disp(b2)} (to {target}, win by 2).",
+        view=view,
+        ephemeral=True,
+        allowed_mentions=ALLOWED_MENTIONS
+    )
 
 # --- Doubles match with points ---
 @tree.command(name="match_doubles_points", description="Record a 2v2 badminton match (point-based)")
@@ -228,8 +237,13 @@ async def match_doubles(
     s2a="Set 2: points for A",
     s2b="Set 2: points for B",
     s3a="Set 3: points for A (optional)",
-    s3b="Set 3: points for B (optional)"
+    s3b="Set 3: points for B (optional)",
+    target="Target points per set (default: 21)"
 )
+@app_commands.choices(target=[
+    app_commands.Choice(name="11 points", value=11),
+    app_commands.Choice(name="21 points", value=21)
+])
 async def match_doubles_points(
     interaction: discord.Interaction,
     a1: discord.User,
@@ -241,7 +255,8 @@ async def match_doubles_points(
     s2a: int,
     s2b: int,
     s3a: int | None = None,
-    s3b: int | None = None
+    s3b: int | None = None,
+    target: int = POINTS_TARGET_DEFAULT
 ):
     if not await require_tos(interaction):
         return
@@ -250,6 +265,7 @@ async def match_doubles_points(
     if len(set(all_players)) != 4:
         await interaction.followup.send("❌ All four players must be different.", ephemeral=True)
         return
+    # Build set_scores from s1*, s2*, s3*
     set_scores = [
         {"A": s1a, "B": s1b},
         {"A": s2a, "B": s2b}
@@ -257,11 +273,13 @@ async def match_doubles_points(
     if s3a is not None and s3b is not None:
         set_scores.append({"A": s3a, "B": s3b})
     # Validate each set
+    cap = derive_cap(target)
     for i, s in enumerate(set_scores):
-        if not valid_set(s["A"], s["B"], POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP):
+        if not valid_set(s["A"], s["B"], target, POINTS_WIN_BY, cap):
             await interaction.followup.send(f"❌ Set {i+1} is not valid.", ephemeral=True)
             return
-    winner, sets_a, sets_b, points_a, points_b = match_winner(set_scores, POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP)
+    # Compute winner and points
+    winner, sets_a, sets_b, pts_a, pts_b = match_winner(set_scores, target, POINTS_WIN_BY, cap)
     if not winner:
         await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
         return
@@ -274,7 +292,8 @@ async def match_doubles_points(
                 team_a=[a1.id, a2.id],
                 team_b=[b1.id, b2.id],
                 set_scores=set_scores,
-                reporter=interaction.user.id
+                reporter=interaction.user.id,
+                target_points=target
             )
         await notify_verification(match_id)
         # Build compact summary
@@ -282,82 +301,58 @@ async def match_doubles_points(
             return getattr(u, 'display_name', None) or u.name
         title = fmt.bold(f"Match #{match_id} — Pending Verification")
         teams = f"{disp(a1)}/{disp(a2)} vs {disp(b1)}/{disp(b2)}"
+        format_line = f"Best-of-3 to {target} (win by {POINTS_WIN_BY})"
         sets_line = fmt.score_sets(set_scores)
         help_line = "Use " + fmt.code("/verify") + " to approve or " + fmt.code('/verify decision:reject') + " to reject."
-        msg = f"{title}\n{teams}\n{sets_line}\n{help_line}"
+        msg = f"{title}\n{teams}\n{format_line}\n{sets_line}\n{help_line}"
         await interaction.followup.send(msg, ephemeral=True)
     except Exception as e:
         log.exception("Failed to create match for user=%s", interaction.user.id)
         await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
 
-# --- Singles match with points ---
-@tree.command(name="match_singles", description="Record a 1v1 badminton match (point-based)")
-@app_commands.describe(
-    a="Player A",
-    b="Player B",
-    s1a="Set 1: points for A",
-    s1b="Set 1: points for B",
-    s2a="Set 2: points for A",
-    s2b="Set 2: points for B",
-    s3a="Set 3: points for A (optional)",
-    s3b="Set 3: points for B (optional)"
-)
-async def match_singles(
-    interaction: discord.Interaction,
-    a: discord.User,
-    b: discord.User,
-    s1a: int,
-    s1b: int,
-    s2a: int,
-    s2b: int,
-    s3a: int | None = None,
-    s3b: int | None = None
-):
-    if not await require_tos(interaction):
+# --- Singles match with dropdown score selection ---
+@tree.command(name="match_singles", description="Report a singles match (pick players, then select scores)")
+@app_commands.describe(a="Player A", b="Player B", target="Target points (11 or 21)")
+@app_commands.choices(target=[
+    app_commands.Choice(name="21", value=21),
+    app_commands.Choice(name="11", value=11),
+])
+async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.User, target: int = 21):
+    from views import ScoreSelectView
+    
+    if not await require_tos(inter):
         return
-    await interaction.response.defer(ephemeral=True)
-    if a.id == b.id:
-        await interaction.followup.send("❌ Players must be different.", ephemeral=True)
-        return
-    set_scores = [
-        {"A": s1a, "B": s1b},
-        {"A": s2a, "B": s2b}
-    ]
-    if s3a is not None and s3b is not None:
-        set_scores.append({"A": s3a, "B": s3b})
-    # Validate each set
-    for i, s in enumerate(set_scores):
-        if not valid_set(s["A"], s["B"], POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP):
-            await interaction.followup.send(f"❌ Set {i+1} is not valid.", ephemeral=True)
-            return
-    winner, sets_a, sets_b, points_a, points_b = match_winner(set_scores, POINTS_TARGET, POINTS_WIN_BY, POINTS_CAP)
-    if not winner:
-        await interaction.followup.send("❌ No winner could be determined from the set scores.", ephemeral=True)
-        return
-    guild_id = interaction.guild_id or 0
-    try:
-        async with get_guild_lock(guild_id):
-            match_id = await insert_pending_match_points(
-                guild_id=guild_id,
-                mode="1v1",
-                team_a=[a.id],
-                team_b=[b.id],
-                set_scores=set_scores,
-                reporter=interaction.user.id
-            )
-        await notify_verification(match_id)
-        # Build compact summary
-        def disp(u: discord.User) -> str:
-            return getattr(u, 'display_name', None) or u.name
-        title = fmt.bold(f"Match #{match_id} — Pending Verification")
-        teams = f"{disp(a)} vs {disp(b)}"
-        sets_line = fmt.score_sets(set_scores)
-        help_line = "Use " + fmt.code("/verify") + " to approve or " + fmt.code('/verify decision:reject') + " to reject."
-        msg = f"{title}\n{teams}\n{sets_line}\n{help_line}"
-        await interaction.followup.send(msg, ephemeral=True)
-    except Exception as e:
-        log.exception("Failed to create match for user=%s", interaction.user.id)
-        await interaction.followup.send(f"❌ Failed to create match: {e}", ephemeral=True)
+    
+    cap = 30 if target >= 21 else 15  # override with your derive_cap() if you have it
+
+    async def on_submit(inter2: discord.Interaction, set_scores: list[dict]):
+        # Validate & finish (reuse your rules + pending + notify)
+        from feather_rank.rules import match_winner
+        try:
+            winner, sa, sb, pts_a, pts_b = match_winner(set_scores, target=target, win_by=2, cap=cap)
+        except Exception as e:
+            return await inter2.response.send_message(f"Invalid scores: {e}", ephemeral=True)
+
+        # persist as PENDING + verification
+        match_id = await db.insert_pending_match_points(
+            guild_id=inter.guild_id or 0,
+            mode="singles",
+            team_a=[a.id],
+            team_b=[b.id],
+            set_scores=set_scores,
+            reporter=inter.user.id,
+            target_points=target
+        )
+        await notify_verification(match_id)  # your existing function
+        await inter2.response.edit_message(content=f"Match #{match_id} created. Waiting for approvals.", view=None)
+
+    view = ScoreSelectView(target=target, cap=cap, on_submit=on_submit)
+    await inter.response.send_message(
+        content=f"Select set scores for {a.mention} vs {b.mention} (to {target}, win by 2).",
+        view=view,
+        ephemeral=True,
+        allowed_mentions=ALLOWED_MENTIONS
+    )
 
 @tree.command(name="leaderboard", description="Show the top players by rating")
 @app_commands.describe(limit="Number of players to show (default: 20)")
@@ -391,6 +386,72 @@ async def leaderboard(interaction: discord.Interaction, limit: int = 20):
     content = "**" + title + "**\n" + "\n".join(lines)
     await interaction.response.send_message(content=content, allowed_mentions=ALLOWED_MENTIONS)
     log.debug("Sent leaderboard for guild=%s, limit=%s", interaction.guild_id, limit)
+
+@tree.command(name="test", description="Run validation tests for scoring rules")
+async def test_command(interaction: discord.Interaction):
+    """Test scoring validation with various scenarios."""
+    from feather_rank.rules import valid_set, match_winner
+    
+    results = []
+    
+    # Test cases for target=11
+    results.append("**Tests for target=11 (cap=15):**")
+    
+    # Test 1: (11,13) - B wins with 2-point margin
+    test1_valid = valid_set(11, 13, target=11, win_by=2, cap=15)
+    results.append(f"✓ (11,13): valid={test1_valid}, expected=True {'✅' if test1_valid else '❌'}")
+    if test1_valid:
+        try:
+            winner1, _, _, _, _ = match_winner([{"A": 11, "B": 13}], target=11, win_by=2, cap=15)
+            results.append(f"  Winner: {winner1}, expected=B {'✅' if winner1 == 'B' else '❌'}")
+        except Exception as e:
+            results.append(f"  Error getting winner: {e} ❌")
+    
+    # Test 2: (13,11) - A wins with 2-point margin
+    test2_valid = valid_set(13, 11, target=11, win_by=2, cap=15)
+    results.append(f"✓ (13,11): valid={test2_valid}, expected=True {'✅' if test2_valid else '❌'}")
+    if test2_valid:
+        try:
+            winner2, _, _, _, _ = match_winner([{"A": 13, "B": 11}], target=11, win_by=2, cap=15)
+            results.append(f"  Winner: {winner2}, expected=A {'✅' if winner2 == 'A' else '❌'}")
+        except Exception as e:
+            results.append(f"  Error getting winner: {e} ❌")
+    
+    # Test 3: (11,10) - Invalid, no 2-point margin
+    test3_valid = valid_set(11, 10, target=11, win_by=2, cap=15)
+    results.append(f"✓ (11,10): valid={test3_valid}, expected=False {'✅' if not test3_valid else '❌'}")
+    
+    # Test 4: (15,14) - Valid at cap (next point wins)
+    test4_valid = valid_set(15, 14, target=11, win_by=2, cap=15)
+    results.append(f"✓ (15,14): valid={test4_valid}, expected=True (at cap) {'✅' if test4_valid else '❌'}")
+    if test4_valid:
+        try:
+            winner4, _, _, _, _ = match_winner([{"A": 15, "B": 14}], target=11, win_by=2, cap=15)
+            results.append(f"  Winner: {winner4}, expected=A {'✅' if winner4 == 'A' else '❌'}")
+        except Exception as e:
+            results.append(f"  Error getting winner: {e} ❌")
+    
+    # Test 5: (14,15) - Valid at cap, B wins
+    test5_valid = valid_set(14, 15, target=11, win_by=2, cap=15)
+    results.append(f"✓ (14,15): valid={test5_valid}, expected=True (at cap) {'✅' if test5_valid else '❌'}")
+    
+    # Additional tests for target=21
+    results.append("\n**Tests for target=21 (cap=30):**")
+    
+    # Test 6: (21,19) - Valid with 2-point margin
+    test6_valid = valid_set(21, 19, target=21, win_by=2, cap=30)
+    results.append(f"✓ (21,19): valid={test6_valid}, expected=True {'✅' if test6_valid else '❌'}")
+    
+    # Test 7: (30,29) - Valid at cap
+    test7_valid = valid_set(30, 29, target=21, win_by=2, cap=30)
+    results.append(f"✓ (30,29): valid={test7_valid}, expected=True (at cap) {'✅' if test7_valid else '❌'}")
+    
+    # Test 8: (21,20) - Invalid, no 2-point margin
+    test8_valid = valid_set(21, 20, target=21, win_by=2, cap=30)
+    results.append(f"✓ (21,20): valid={test8_valid}, expected=False {'✅' if not test8_valid else '❌'}")
+    
+    summary = "\n".join(results)
+    await interaction.response.send_message(f"**Scoring Rules Validation Tests:**\n\n{summary}", ephemeral=True)
 
 @tree.command(name="stats", description="Show player statistics")
 @app_commands.describe(user="The user to show stats for")
@@ -649,14 +710,17 @@ async def finalize_match(match_id: int):
     except Exception:
         set_scores = []
         log.exception("Failed to parse set_scores for match=%s", match_id)
+    # Get target_points from match or use default
+    target_points = match.get('target_points') or POINTS_TARGET_DEFAULT
+    cap = derive_cap(target_points)
     # Compute winner, points
-    winner, _, _, points_a, points_b = match_winner(
+    winner, sa, sb, pts_a, pts_b = match_winner(
         set_scores,
-        POINTS_TARGET,
+        target_points,
         POINTS_WIN_BY,
-        POINTS_CAP
+        cap
     )
-    share_a = points_a / max(1, (points_a + points_b))
+    share_a = pts_a / max(1, (pts_a + pts_b))
     # Get player info
     players_a = [await get_or_create_player(uid, f"User{uid}") for uid in team_a_ids]
     players_b = [await get_or_create_player(uid, f"User{uid}") for uid in team_b_ids]
@@ -671,16 +735,17 @@ async def finalize_match(match_id: int):
         await update_player(p['user_id'], new_ratings_b[i], won=(winner == 'B'))
     # Finalize match in DB
     from feather_rank.db import finalize_points
-    await finalize_points(match_id, winner, set_scores, points_a, points_b)
-    log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, points_a, points_b)
+    await finalize_points(match_id, winner, set_scores, pts_a, pts_b)
+    log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, pts_a, pts_b)
     # Build summary with per-set scores
-    summary = f"🏸 Match Verified!\nMatch ID: {match_id}\nMode: {mode}\nWinner: Team {winner}\n"
+    summary = f"🏸 **Match Verified** — to {target_points}, win by {POINTS_WIN_BY}\n"
+    summary += f"Match ID: {match_id}\nMode: {mode}\nWinner: Team {winner}\n"
     summary += f"Team A: {', '.join(str(uid) for uid in team_a_ids)}\n"
     summary += f"Team B: {', '.join(str(uid) for uid in team_b_ids)}\n"
     summary += "Set Scores:\n"
     for idx, s in enumerate(set_scores, 1):
         summary += f"  Set {idx}: A {s.get('A', 0)} - B {s.get('B', 0)}\n"
-    summary += f"Total Points: A {points_a} - B {points_b}\n"
+    summary += f"Total Points: A {pts_a} - B {pts_b}\n"
     # Try to post in channel (if available)
     channel_id = match.get('channel_id')
     sent = False
@@ -908,14 +973,18 @@ async def try_finalize_match(match_id: int):
         set_scores = []
         log.exception("Failed to parse set_scores for match=%s", match_id)
     
+    # Get target_points from match or use default
+    target_points = match.get('target_points') or POINTS_TARGET_DEFAULT
+    cap = derive_cap(target_points)
+    
     # Compute winner and points
-    winner, _, _, points_a, points_b = match_winner(
+    winner, sa, sb, pts_a, pts_b = match_winner(
         set_scores,
-        POINTS_TARGET,
+        target_points,
         POINTS_WIN_BY,
-        POINTS_CAP
+        cap
     )
-    share_a = points_a / max(1, (points_a + points_b))
+    share_a = pts_a / max(1, (pts_a + pts_b))
     
     # Get player info
     players_a = [await get_or_create_player(uid, f"User{uid}") for uid in team_a_ids]
@@ -933,13 +1002,13 @@ async def try_finalize_match(match_id: int):
         await update_player(p['user_id'], new_ratings_b[i], won=(winner == 'B'))
     
     # Call finalize_points then set status='verified'
-    await finalize_points(match_id, winner, set_scores, points_a, points_b)
+    await finalize_points(match_id, winner, set_scores, pts_a, pts_b)
     await set_match_status(match_id, "verified")
     
-    log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, points_a, points_b)
+    log.info("Match #%s finalized: winner=%s points A=%s B=%s", match_id, winner, pts_a, pts_b)
     
     # Post public summary (channel/thread) with display names only (no pings)
-    title = fmt.bold(f"🏸 Match #{match_id} Verified!")
+    title = fmt.bold(f"🏸 Match #{match_id} Verified — to {target_points}, win by {POINTS_WIN_BY}")
     
     # Build team lines with display names
     team_a_lines = []
@@ -961,7 +1030,7 @@ async def try_finalize_match(match_id: int):
     
     # Winner and points
     winner_line = f"**Winner:** Team {winner}"
-    points_line = f"**Total Points:** A {points_a} - B {points_b}"
+    points_line = f"**Total Points:** A {pts_a} - B {pts_b}"
     
     summary = f"{title}\n{teams_section}\n\n{sets_section}\n{winner_line}\n{points_line}"
     
