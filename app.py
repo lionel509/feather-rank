@@ -309,7 +309,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             pass
 
         # Only referee (or admins) may press
-        sb = await db.get_scoreboard(sb_row["scoreboard_id"])
+        sb = await db.get_scoreboard(sb_row["id"])
         if payload.user_id != sb["referee_id"]:
             # (optional) silently remove reaction for others
             try:
@@ -327,28 +327,29 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
             pass
 
         # Load set scores
-        s = await db.get_set(sb["id"], sb_row["set_no"])
+        set_no = getattr(payload, "set_no", 1)  # fallback to 1 if not present
+        s = await db.get_set(sb["id"], set_no)
         a, b = int(s["a_points"]), int(s["b_points"])
 
         changed = False
         if emoji == EMOJI_A_PLUS:
             a += 1
             changed = True
-            await db.record_play(sb["id"], sb_row["set_no"], "A", +1)
+            await db.record_play(sb["id"], set_no, "A", +1)
             await db.set_serve_side(sb["id"], "A")
         elif emoji == EMOJI_B_PLUS:
             b += 1
             changed = True
-            await db.record_play(sb["id"], sb_row["set_no"], "B", +1)
+            await db.record_play(sb["id"], set_no, "B", +1)
             await db.set_serve_side(sb["id"], "B")
         elif emoji == EMOJI_UNDO:
-            lp = await db.last_play(sb["id"], sb_row["set_no"])
+            lp = await db.last_play(sb["id"], set_no)
             if lp:
                 if lp["side"] == "A":
                     a = max(0, a - 1)
                 else:
                     b = max(0, b - 1)
-                await db.delete_last_play(sb["id"], sb_row["set_no"])
+                await db.delete_last_play(sb["id"], set_no)
                 changed = True
         elif emoji == EMOJI_SERVE:
             current_serve = sb.get("serve_side")
@@ -364,12 +365,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
 
         # Persist
         if changed:
-            await db.upsert_set(sb["id"], sb_row["set_no"], a, b, None)
+            await db.upsert_set(sb["id"], set_no, a, b, None)
 
         # Check set winner
         finished, winner = set_finished(a, b, sb["target_points"], win_by=2, cap=sb["cap_points"])
         if finished and winner:
-            await db.upsert_set(sb["id"], sb_row["set_no"], a, b, winner)
+            await db.upsert_set(sb["id"], set_no, a, b, winner)
 
             # Append "✅ Set {n} to {A/B}" to the current message
             try:
@@ -413,7 +414,7 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent):
                 return
 
         # Otherwise, just update the current message
-        await edit_scoreboard_message(msg, sb["id"], sb_row["set_no"])
+        await edit_scoreboard_message(msg, sb["id"], set_no)
         return
 
     # VERIFICATION BRANCH - fall through to existing verification reactions (✅/❌)

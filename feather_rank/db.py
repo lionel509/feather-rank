@@ -286,11 +286,30 @@ async def table_has_column(table: str, column: str, db_path: str = "feather_rank
 DB_PATH = "feather_rank.db"
 
 async def init_db(db_path: str = "feather_rank.db"):
+        # Add status column to scoreboards if missing
+        if not await table_has_column("scoreboards", "status", DB_PATH):
+            await db.execute("ALTER TABLE scoreboards ADD COLUMN status TEXT")
     """Initialize the database with required tables and columns."""
     global DB_PATH
     DB_PATH = db_path
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # Add serve_side column to scoreboards if missing
+        if not await table_has_column("scoreboards", "serve_side", DB_PATH):
+            await db.execute("ALTER TABLE scoreboards ADD COLUMN serve_side TEXT")
+        # Create scoreboard_plays table
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scoreboard_plays (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scoreboard_id INTEGER NOT NULL,
+                set_no INTEGER NOT NULL,
+                side TEXT NOT NULL,
+                delta INTEGER NOT NULL,
+                played_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            )
+            """
+        )
         # Create players table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS players (
@@ -407,6 +426,48 @@ async def init_db(db_path: str = "feather_rank.db"):
               accepted_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
               version     TEXT NOT NULL DEFAULT 'v1',
               signed_name TEXT
+            )
+            """
+        )
+
+        # Create scoreboards table
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scoreboards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                target_points INTEGER NOT NULL,
+                cap_points INTEGER NOT NULL,
+                team_a TEXT NOT NULL,
+                team_b TEXT NOT NULL,
+                referee_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            )
+            """
+        )
+
+        # Create scoreboard_sets table
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scoreboard_sets (
+                scoreboard_id INTEGER NOT NULL,
+                set_no INTEGER NOT NULL,
+                a_points INTEGER NOT NULL,
+                b_points INTEGER NOT NULL,
+                winner INTEGER,
+                PRIMARY KEY(scoreboard_id, set_no)
+            )
+            """
+        )
+
+        # Create scoreboard_messages table
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scoreboard_messages (
+                message_id INTEGER PRIMARY KEY,
+                scoreboard_id INTEGER NOT NULL,
+                set_no INTEGER NOT NULL
             )
             """
         )
