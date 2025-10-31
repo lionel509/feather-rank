@@ -286,9 +286,6 @@ async def table_has_column(table: str, column: str, db_path: str = "feather_rank
 DB_PATH = "feather_rank.db"
 
 async def init_db(db_path: str = "feather_rank.db"):
-        # Add status column to scoreboards if missing
-        if not await table_has_column("scoreboards", "status", DB_PATH):
-            await db.execute("ALTER TABLE scoreboards ADD COLUMN status TEXT")
     """Initialize the database with required tables and columns."""
     global DB_PATH
     DB_PATH = db_path
@@ -446,6 +443,25 @@ async def init_db(db_path: str = "feather_rank.db"):
             )
             """
         )
+
+        # Ensure status column for scoreboards (live/complete)
+        if not await table_has_column("scoreboards", "status", DB_PATH):
+            try:
+                await db.execute("ALTER TABLE scoreboards ADD COLUMN status TEXT")
+            except Exception:
+                pass
+        # Ensure serve_side column for scoreboards
+        if not await table_has_column("scoreboards", "serve_side", DB_PATH):
+            try:
+                await db.execute("ALTER TABLE scoreboards ADD COLUMN serve_side TEXT")
+            except Exception:
+                pass
+        # Ensure pending_match_id column to link created pending match
+        if not await table_has_column("scoreboards", "pending_match_id", DB_PATH):
+            try:
+                await db.execute("ALTER TABLE scoreboards ADD COLUMN pending_match_id INTEGER")
+            except Exception:
+                pass
 
         # Create scoreboard_sets table
         await db.execute(
@@ -955,3 +971,14 @@ async def set_referee(scoreboard_id: int, referee_id: int) -> None:
         )
         await db.commit()
     log.debug("set_referee scoreboard=%s referee_id=%s", scoreboard_id, referee_id)
+
+
+async def set_scoreboard_pending_match(scoreboard_id: int, match_id: int) -> None:
+    """Store the pending match id associated with a scoreboard (for bookkeeping)."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE scoreboards SET pending_match_id = ? WHERE id = ?",
+            (match_id, scoreboard_id)
+        )
+        await db.commit()
+    log.debug("set_scoreboard_pending_match scoreboard=%s match_id=%s", scoreboard_id, match_id)

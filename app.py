@@ -280,13 +280,18 @@ async def finalize_scoreboard_match(scoreboard_id: int) -> None:
         team_a=[int(x) for x in sb["team_a"].split(",") if x],
         team_b=[int(x) for x in sb["team_b"].split(",") if x],
         set_scores=set_scores,
-        reporter=sb["referee_id"]
+        reporter=sb["referee_id"],
+        target_points=sb.get("target_points") or POINTS_TARGET_DEFAULT
     )
     await db.set_status(scoreboard_id, "complete")
+    try:
+        await db.set_scoreboard_pending_match(scoreboard_id, match_id)
+    except Exception:
+        pass
     log.info("Finalized scoreboard match id=%s -> match_id=%s winner=%s", scoreboard_id, match_id, winner)
 
     # Option A: send through existing verification flow
-    await notify_verification(match_id)
+    await notify_verification(match_id, include_reporter=True)
 
     # Option B (if ref == verifier): directly call try_finalize_match(match_id)
     # await try_finalize_match(match_id)
@@ -816,7 +821,12 @@ async def scoreboard(
     await db.upsert_set(sb_id, 1, 0, 0, None)
 
     # Post Set 1 message and add reactions
-    msg = await post_scoreboard_message(inter, sb_id, set_no=1)  # implement in next step
+    msg = await post_scoreboard_message(inter, sb_id, set_no=1)
+    # Optional heads-up DMs to participants and referee
+    try:
+        await notify_scoreboard_started(sb_id)
+    except Exception:
+        pass
     await inter.response.send_message(f"Started scoreboard #{sb_id} (ref: {ref.mention}). See set message below.", ephemeral=True)
 
 # Scoreboard referee change
@@ -865,57 +875,85 @@ async def scoreboard_referee(
     )
 
 # --- Verification utilities ---
-async def notify_verification(match_id: int):
+async def notify_scoreboard_started(sb_id: int):
+    """DM participants and referee a quick FYI that a live scoreboard has started."""
+    sb = await db.get_scoreboard(sb_id)
+    if not sb:
+        return
+    guild = bot.get_guild(sb.get("guild_id")) if sb.get("guild_id") else None
+    a_ids = [int(x) for x in (sb.get("team_a") or "").split(",") if x]
+    b_ids = [int(x) for x in (sb.get("team_b") or "").split(",") if x]
+    ref_id = sb.get("referee_id")
+    title = fmt.bold(f"Live scoreboard started — #{sb_id}")
+    body = ("A live scoreboard has started. After the match ends you'll receive a verification DM."
+            "\nThis message is informational only.")
+    user_ids = set(a_ids + b_ids + ([ref_id] if ref_id else []))
+    for uid in user_ids:
+        try:
+            user = await bot.fetch_user(uid)
+            await user.send(f"{title}\n{body}", allowed_mentions=ALLOWED_MENTIONS)
+        except Exception:
+            pass
+
+async def notify_verification(match_id: int, include_reporter: bool = False):
+    """
+    DM participants about a pending match.
+    - If include_reporter=True, also DM the reporter with an FYI-only message (no reactions, no verification row).
+    - Players (non-reporters) receive actionable DMs: reactions ✅/❌ and /verify instructions.
+    """
     match = await db.get_match(match_id)
     if not match:
         log.error("Notify failed: match not found id=%s", match_id)
         return
 
-    participants = await db.get_match_participant_ids(match_id)
-    reporter = match.get("reporter")
-    non_reporters = [uid for uid in participants if uid != reporter]
-
     guild_id = match.get("guild_id")
     guild = bot.get_guild(guild_id) if guild_id else None
+    reporter = match.get("reporter")
+    participants = await db.get_match_participant_ids(match_id)
 
-    # Teams
+    # Build names
     a_ids = [int(x) for x in (match.get("team_a") or "").split(",") if x]
     b_ids = [int(x) for x in (match.get("team_b") or "").split(",") if x]
     a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in a_ids]
     b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in b_ids]
 
-    # Sets
+    # Sets summary
     try:
         set_scores = json.loads(match.get("set_scores") or "[]")
     except Exception:
         set_scores = []
     sets_line = fmt.score_sets(set_scores) if set_scores else "N/A"
 
-    title = fmt.bold(f"Please verify Match #{match_id}")
-    tip = fmt.block("/verify\n/verify decision:approve name:YourName\n/verify decision:reject name:YourName", "md")
-    msg = f"{title}\n{'/'.join(a_names)} vs {'/'.join(b_names)}\n{sets_line}\nReact {EMOJI_APPROVE} to approve or {EMOJI_REJECT} to reject.\n\n{tip}"
+    title = fmt.bold(f"Match #{match_id} pending verification")
+    tip   = fmt.block("/verify decision:approve name:YourName\n/verify decision:reject  name:YourName", "md")
+    body  = f"{'/'.join(a_names)} vs {'/'.join(b_names)}\n{sets_line}\n"
 
+    # Send to players (non-reporters) with reactions + verification rows
+    non_reporters = [uid for uid in participants if uid != reporter]
     for user_id in non_reporters:
         try:
             user = await bot.fetch_user(user_id)
-            dm = await user.send(msg, allowed_mentions=ALLOWED_MENTIONS)
+            dm = await user.send(f"{title}\n{body}\nReact {EMOJI_APPROVE} to approve or {EMOJI_REJECT} to reject.\n\n{tip}",
+                                 allowed_mentions=ALLOWED_MENTIONS)
+            # Add reactions for quick approve/reject
             try:
                 await dm.add_reaction(EMOJI_APPROVE)
                 await dm.add_reaction(EMOJI_REJECT)
             except Exception:
                 pass
+            # Track this DM so on_raw_reaction_add can record the decision
             await db.record_verification_message(dm.id, match_id, guild_id, user_id)
         except discord.Forbidden:
-            # Fallback to a channel we can post in
+            # Fallback to a guild text channel we can post in
             try:
                 channel = getattr(guild, "system_channel", None)
                 if channel is None:
                     for ch in getattr(guild, "channels", []) or []:
                         if isinstance(ch, discord.TextChannel) and ch.permissions_for(ch.guild.me).send_messages:
-                            channel = ch
-                            break
+                            channel = ch; break
                 if channel and isinstance(channel, (discord.TextChannel, discord.Thread)):
-                    post = await channel.send(msg, allowed_mentions=ALLOWED_MENTIONS)
+                    post = await channel.send(f"{title}\n{body}\n(Unable to DM <@{user_id}> — please use /verify in this server.)\n\n{tip}",
+                                              allowed_mentions=ALLOWED_MENTIONS)
                     try:
                         await post.add_reaction(EMOJI_APPROVE)
                         await post.add_reaction(EMOJI_REJECT)
@@ -924,6 +962,19 @@ async def notify_verification(match_id: int):
                     await db.record_verification_message(post.id, match_id, guild_id, user_id)
             except Exception:
                 log.debug("Channel fallback failed for user=%s match=%s", user_id, match_id, exc_info=True)
+        except Exception:
+            log.debug("DM failed for user=%s match=%s", user_id, match_id, exc_info=True)
+
+    # Optional: also DM the reporter (referee) with FYI-only text (no reactions, no verification row)
+    if include_reporter and reporter:
+        try:
+            user = await bot.fetch_user(reporter)
+            fyi = (f"{fmt.bold('FYI: match pending verification')}\n"
+                   f"Match #{match_id}\n{body}\n"
+                   f"Players have been notified to verify. You (reporter) cannot verify this match.")
+            await user.send(fyi, allowed_mentions=ALLOWED_MENTIONS)
+        except Exception:
+            log.debug("Failed to DM reporter=%s for pending match=%s", reporter, match_id)
 
 async def try_finalize_match(match_id: int):
     """
