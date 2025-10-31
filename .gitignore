@@ -210,3 +210,7 @@ __marimo__/
 
 # Project-specific
 /data
+*.db
+*.sqlite
+test_*.db
+test_*.sqlite
