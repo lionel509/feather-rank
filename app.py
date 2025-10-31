@@ -628,7 +628,24 @@ async def match_singles(inter: discord.Interaction, a: discord.User, b: discord.
             target_points=target
         )
         await notify_verification(mid)
-        await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+        # Robustly update the original view message even if the interaction token is no longer valid
+        try:
+            if getattr(i2.response, "is_done", lambda: False)():
+                try:
+                    await i2.followup.edit_message(message_id=getattr(i2, "message", None).id if getattr(i2, "message", None) else None,
+                                                   content=f"Match #{mid} created. Waiting for approvals.", view=None)
+                except Exception:
+                    # Fallback: edit via message handle if accessible
+                    if getattr(i2, "message", None):
+                        try:
+                            await i2.message.edit(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+                        except Exception:
+                            pass
+            else:
+                await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+        except Exception:
+            # Ignore occasional Unknown interaction (10062)
+            pass
 
     # Pager-based score picker view
     try:
@@ -686,7 +703,22 @@ async def match_doubles(
             target_points=target
         )
         await notify_verification(mid)
-        await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+        # Robustly update the original view message even if the interaction token is no longer valid
+        try:
+            if getattr(i2.response, "is_done", lambda: False)():
+                try:
+                    await i2.followup.edit_message(message_id=getattr(i2, "message", None).id if getattr(i2, "message", None) else None,
+                                                   content=f"Match #{mid} created. Waiting for approvals.", view=None)
+                except Exception:
+                    if getattr(i2, "message", None):
+                        try:
+                            await i2.message.edit(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+                        except Exception:
+                            pass
+            else:
+                await i2.response.edit_message(content=f"Match #{mid} created. Waiting for approvals.", view=None)
+        except Exception:
+            pass
 
     # Pager-based score picker view
     try:
@@ -933,15 +965,7 @@ async def notify_verification(match_id: int, include_reporter: bool = False):
         log.error("Notify failed: match not found id=%s", match_id)
         return
 
-<<<<<<< HEAD
-=======
-    participants = await db.get_match_participant_ids(match_id)
-    reporter = match.get("reporter")
-    # Filter out bot from non-reporters (bot doesn't need to verify)
-    bot_id = _get_bot_id()
-    non_reporters = [uid for uid in participants if uid != reporter and uid != bot_id]
 
->>>>>>> 6fcaf1b7e22f7121778d824ae71092e94d6efe25
     guild_id = match.get("guild_id")
     guild = bot.get_guild(guild_id) if guild_id else None
     reporter = match.get("reporter")
