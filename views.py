@@ -47,15 +47,38 @@ class PointsScoreView(discord.ui.View):
 
 # --- New pager-based scoring UI with two-tier number picker ---
 
-def _ranges_for_cap(cap:int) -> list[tuple[int,int]]:
-    if cap <= 15:
-        return [(0,10), (11,cap)]
-    return [(0,10), (11,21), (22,cap)]
+def _ranges_for_cap(cap:int, max_display:int|None=None) -> list[tuple[int,int]]:
+    """
+    Build compact ranges for the number picker without exceeding the 25-option
+    limit of Discord selects.
+
+    Previously this always included the deuce band (22..cap) when target=21,
+    which made sense for full-range entry but was confusing when we only want
+    to allow values up to the target in the per-side picker. To better fit the
+    “scores can range 0–21” expectation, we cap the visible ranges at
+    `max_display` when provided.
+
+    Examples:
+      - cap=30, max_display=21 -> [(0,10), (11,21)]
+      - cap=15, max_display=11 -> [(0,10), (11,11)]
+      - cap=15, max_display=None -> [(0,10), (11,15)]
+    """
+    m = min(cap, max_display) if max_display is not None else cap
+    if m <= 15:
+        return [(0,10), (11,m)]
+    if m <= 21:
+        return [(0,10), (11,m)]
+    # If the maximum exceeds 21, split off the deuce/high band
+    return [(0,10), (11,21), (22,m)]
 
 class NumberPicker(discord.ui.Select):
     def __init__(self, set_idx:int, side:str, target:int, cap:int|None, value:int|None=None, row:int|None=None):
         self.set_idx, self.side = set_idx, side
         self.cap = cap or (30 if target >= 21 else 15)
+        # Limit the UI picker to the target by default (e.g., 0–21), to avoid
+        # showing the 22–30 band in the first step. Users can still submit
+        # deuce scores via the dedicated paired-score selector.
+        self.max_display = min(self.cap, target)
         self._value = value
         self.mode = "range"  # or "exact"
         self.current_range: tuple[int,int] | None = None
@@ -67,7 +90,7 @@ class NumberPicker(discord.ui.Select):
         return f"Set {self.set_idx} — {who} points{suffix}"
 
     def _range_options(self):
-        opts = [discord.SelectOption(label=f"{lo}–{hi}", value=f"R:{lo}:{hi}") for lo,hi in _ranges_for_cap(self.cap)]
+        opts = [discord.SelectOption(label=f"{lo}–{hi}", value=f"R:{lo}:{hi}") for lo,hi in _ranges_for_cap(self.cap, self.max_display)]
         if self._value is not None:
             opts.append(discord.SelectOption(label=f"Clear (was {self._value})", value="CLR"))
         return opts
