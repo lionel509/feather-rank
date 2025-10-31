@@ -39,7 +39,15 @@ EPHEMERAL_DB = os.getenv("EPHEMERAL_DB", "0").lower() in ("1", "true", "yes")
 PIN_SCOREBOARD = os.getenv("PIN_SCOREBOARD", "0").lower() in ("1","true","yes")
 
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
-GUEST_RATING = float(os.getenv("GUEST_RATING", "1200"))  # Rating for bot/guest players
+# Rating for bot/guest players - validate it's positive
+try:
+    GUEST_RATING = float(os.getenv("GUEST_RATING", "1200"))
+    if GUEST_RATING <= 0:
+        log.warning("GUEST_RATING must be positive, using default 1200")
+        GUEST_RATING = 1200.0
+except ValueError:
+    log.warning("Invalid GUEST_RATING value, using default 1200")
+    GUEST_RATING = 1200.0
 
 DATABASE_PATH = os.getenv(
     "DATABASE_PATH",
@@ -651,7 +659,7 @@ async def match_doubles(
     all_ids = [a1.id, a2.id, b1.id, b2.id]
     # Allow bot to be used as random/guest player, so filter it out from uniqueness check
     bot_id = _get_bot_id()
-    non_bot_ids = [uid for uid in all_ids if uid != bot_id]
+    non_bot_ids = [uid for uid in all_ids if uid != bot_id] if bot_id else all_ids
     # Check if there are duplicate human players (excluding bot)
     if len(set(non_bot_ids)) < len(non_bot_ids):
         return await inter.response.send_message("❌ All players (excluding bot) must be different.", ephemeral=True)
