@@ -40,6 +40,16 @@
 
 Track 1v1 and 2v2 badminton matches right inside Discord. Pick players with User Select menus, report set winners or points, and auto-update ratings with a configurable Elo (or Glicko-2) system. View leaderboards, player cards, and match history, all powered by slash/context commands and interactive components.
 
+### Random/Guest Player
+
+For doubles matches, you can use the bot itself as a placeholder for a random or guest player:
+
+- When creating a match with `/match_doubles`, select the bot user for any of the four player slots
+- The bot will use a default guest rating (configurable via `GUEST_RATING` env var, defaults to 1200)
+- The bot doesn't need to verify the match - only the human players do
+- The bot's rating won't be updated after the match
+- This is useful when you have an odd number of players and need to fill a spot
+
 ## Scoring Rules
 
 Matches are played **best-of-3 sets**. Each set follows badminton rally point scoring:
@@ -77,6 +87,13 @@ POINTS_WIN_BY=2
 POINTS_CAP=30
 
 # Set POINTS_CAP to empty or omit to disable cap entirely
+
+# Set guest/random player rating (default: 1200)
+# Used when the bot is selected as a player in doubles matches
+GUEST_RATING=1200
+
+# Set K-factor for rating calculations (default: 32)
+K_FACTOR=32
 ```
 
 When `POINTS_CAP` is not set, the cap is automatically derived:

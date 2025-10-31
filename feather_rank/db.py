@@ -273,8 +273,20 @@ import aiosqlite
 from datetime import datetime
 from typing import Optional
 
+# Helper to check if a table exists
+async def table_exists(table: str, db_path: str = "feather_rank.db") -> bool:
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
+            (table,)
+        ) as cursor:
+            row = await cursor.fetchone()
+            return row is not None
+
 # Helper to check if a table has a column
 async def table_has_column(table: str, column: str, db_path: str = "feather_rank.db") -> bool:
+    if not await table_exists(table, db_path):
+        return False
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(f"PRAGMA table_info({table})") as cursor:
             async for row in cursor:
@@ -291,6 +303,22 @@ async def init_db(db_path: str = "feather_rank.db"):
     DB_PATH = db_path
 
     async with aiosqlite.connect(DB_PATH) as db:
+        # Create scoreboards table first (before ALTER statements)
+        await db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scoreboards (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                guild_id INTEGER NOT NULL,
+                mode TEXT NOT NULL,
+                target_points INTEGER NOT NULL,
+                cap_points INTEGER NOT NULL,
+                team_a TEXT NOT NULL,
+                team_b TEXT NOT NULL,
+                referee_id INTEGER NOT NULL,
+                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+            )
+            """
+        )
         # Add status column to scoreboards if missing
         if not await table_has_column("scoreboards", "status", DB_PATH):
             await db.execute("ALTER TABLE scoreboards ADD COLUMN status TEXT")
@@ -430,22 +458,8 @@ async def init_db(db_path: str = "feather_rank.db"):
             """
         )
 
-        # Create scoreboards table
-        await db.execute(
-            """
-            CREATE TABLE IF NOT EXISTS scoreboards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id INTEGER NOT NULL,
-                mode TEXT NOT NULL,
-                target_points INTEGER NOT NULL,
-                cap_points INTEGER NOT NULL,
-                team_a TEXT NOT NULL,
-                team_b TEXT NOT NULL,
-                referee_id INTEGER NOT NULL,
-                created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-            )
-            """
-        )
+        # scoreboards table already created above
+
 
         # Create scoreboard_sets table
         await db.execute(
