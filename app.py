@@ -104,6 +104,20 @@ TOS_TEXT = (
     "Type /agree_tos to continue."
 )
 
+def _get_bot_id() -> int | None:
+    """Get the bot's user ID if available."""
+    return bot.user.id if bot.user else None
+
+def _create_guest_player(user_id: int) -> dict:
+    """Create a guest player dictionary for the bot with default guest rating."""
+    return {
+        "user_id": user_id,
+        "username": "Guest",
+        "rating": GUEST_RATING,
+        "wins": 0,
+        "losses": 0
+    }
+
 # --- Helpers ---
 async def has_accepted_tos_safe(user_id: int) -> bool:
     """Check ToS acceptance; if table missing, create schema and retry."""
@@ -636,9 +650,10 @@ async def match_doubles(
         return
     all_ids = [a1.id, a2.id, b1.id, b2.id]
     # Allow bot to be used as random/guest player, so filter it out from uniqueness check
-    bot_id = bot.user.id if bot.user else None
+    bot_id = _get_bot_id()
     non_bot_ids = [uid for uid in all_ids if uid != bot_id]
-    if len(set(non_bot_ids)) != len(non_bot_ids):
+    # Check if there are duplicate human players (excluding bot)
+    if len(set(non_bot_ids)) < len(non_bot_ids):
         return await inter.response.send_message("❌ All players (excluding bot) must be different.", ephemeral=True)
     cap = derive_cap(target)
 
@@ -878,7 +893,7 @@ async def notify_verification(match_id: int):
     participants = await db.get_match_participant_ids(match_id)
     reporter = match.get("reporter")
     # Filter out bot from non-reporters (bot doesn't need to verify)
-    bot_id = bot.user.id if bot.user else None
+    bot_id = _get_bot_id()
     non_reporters = [uid for uid in participants if uid != reporter and uid != bot_id]
 
     guild_id = match.get("guild_id")
@@ -955,7 +970,7 @@ async def try_finalize_match(match_id: int):
         return
 
     # Filter out bot from non-reporters (bot doesn't need to verify)
-    bot_id = bot.user.id if bot.user else None
+    bot_id = _get_bot_id()
     non_reporters = [pid for pid in participants if pid != reporter and pid != bot_id]
     required = non_reporters[:1] if match.get("mode") == "1v1" else non_reporters
     approved_users = {s.get("user_id") for s in sigs if s.get("decision") == "approve"}
@@ -976,22 +991,20 @@ async def try_finalize_match(match_id: int):
     a_ids = [int(x) for x in (match.get("team_a") or "").split(",") if x]
     b_ids = [int(x) for x in (match.get("team_b") or "").split(",") if x]
 
-    bot_id = bot.user.id if bot.user else None
+    bot_id = _get_bot_id()
     
     # Get or create players, using guest rating for bot
     players_a = []
     for uid in a_ids:
         if uid == bot_id:
-            # Create a fake player dict for bot with guest rating
-            players_a.append({"user_id": uid, "username": "Guest", "rating": GUEST_RATING, "wins": 0, "losses": 0})
+            players_a.append(_create_guest_player(uid))
         else:
             players_a.append(await db.get_or_create_player(uid, f"User{uid}"))
     
     players_b = []
     for uid in b_ids:
         if uid == bot_id:
-            # Create a fake player dict for bot with guest rating
-            players_b.append({"user_id": uid, "username": "Guest", "rating": GUEST_RATING, "wins": 0, "losses": 0})
+            players_b.append(_create_guest_player(uid))
         else:
             players_b.append(await db.get_or_create_player(uid, f"User{uid}"))
     
