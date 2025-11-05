@@ -147,7 +147,10 @@ async def require_tos(inter: discord.Interaction) -> bool:
     return True
 
 async def _names(bot: discord.Client, guild: discord.Guild | None, ids: list[int]) -> str:
-    """Helper to format player names from user IDs."""
+    """Helper to format player names from user IDs.
+    
+    Returns display names (not mentions) to avoid pinging users in scoreboard messages.
+    """
     parts = []
     for uid in ids:
         parts.append(await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}"))
