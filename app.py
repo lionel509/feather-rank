@@ -32,6 +32,12 @@ except Exception:  # pragma: no cover
 from dotenv import load_dotenv
 load_dotenv()
 
+# Constants
+BEST_OF_SETS = 3
+MIN_SETS_REQUIRED = 2
+DEFAULT_RATING = 1200.0
+CACHE_TTL_SECONDS = 300.0
+
 TOKEN = os.getenv("DISCORD_TOKEN")
 TEST_MODE = os.getenv("TEST_MODE", "0").lower() in ("1", "true", "yes")
 TEST_GUILD_ID = int(os.getenv("TEST_GUILD_ID", "0") or 0) or None
@@ -41,13 +47,13 @@ PIN_SCOREBOARD = os.getenv("PIN_SCOREBOARD", "0").lower() in ("1","true","yes")
 K_FACTOR = int(os.getenv("K_FACTOR", "32"))
 # Rating for bot/guest players - validate it's positive
 try:
-    GUEST_RATING = float(os.getenv("GUEST_RATING", "1200"))
+    GUEST_RATING = float(os.getenv("GUEST_RATING", str(DEFAULT_RATING)))
     if GUEST_RATING <= 0:
-        log.warning("GUEST_RATING must be positive, using default 1200")
-        GUEST_RATING = 1200.0
+        log.warning("GUEST_RATING must be positive, using default %.1f", DEFAULT_RATING)
+        GUEST_RATING = DEFAULT_RATING
 except ValueError:
-    log.warning("Invalid GUEST_RATING value, using default 1200")
-    GUEST_RATING = 1200.0
+    log.warning("Invalid GUEST_RATING value, using default %.1f", DEFAULT_RATING)
+    GUEST_RATING = DEFAULT_RATING
 
 DATABASE_PATH = os.getenv(
     "DATABASE_PATH",
@@ -116,6 +122,10 @@ def _get_bot_id() -> int | None:
     """Get the bot's user ID if available."""
     return bot.user.id if bot.user else None
 
+def _parse_team_ids(team_str: str) -> list[int]:
+    """Parse comma-separated team IDs string into list of integers."""
+    return [int(x) for x in team_str.split(",") if x]
+
 def _create_guest_player(user_id: int) -> dict:
     """Create a guest player dictionary for the bot with default guest rating."""
     return {
@@ -160,21 +170,20 @@ def _serve_marker(serve_side: str | None) -> str:
     """Helper to display serve indicator."""
     return "▶ A" if serve_side == "A" else ("▶ B" if serve_side == "B" else "—")
 
-async def post_scoreboard_message(inter: discord.Interaction, scoreboard_id: int, set_no: int) -> discord.Message:
-    """Post a scoreboard message and add reaction controls."""
+async def _format_scoreboard_content(scoreboard_id: int, set_no: int, guild: discord.Guild | None) -> str:
+    """Format scoreboard message content (DRY helper for post/edit)."""
     sb = await db.get_scoreboard(scoreboard_id)
     s = await db.get_set(scoreboard_id, set_no)
-    guild = inter.guild
-
-    a_names = await _names(bot, guild, [int(x) for x in (sb["team_a"].split(",")) if x])
-    b_names = await _names(bot, guild, [int(x) for x in (sb["team_b"].split(",")) if x])
-
-    title = f"🏸 Live Scoreboard #{scoreboard_id} — Set {set_no}/{3}"
-    fmtline = f"Best-of-3 to {sb['target_points']} (win by 2, cap {sb['cap_points']})"
+    
+    a_names = await _names(bot, guild, _parse_team_ids(sb["team_a"]))
+    b_names = await _names(bot, guild, _parse_team_ids(sb["team_b"]))
+    
+    title = f"🏸 Live Scoreboard #{scoreboard_id} — Set {set_no}/{BEST_OF_SETS}"
+    fmtline = f"Best-of-{BEST_OF_SETS} to {sb['target_points']} (win by {POINTS_WIN_BY}, cap {sb['cap_points']})"
     score = f"**A {s['a_points']} — {s['b_points']} B**"
     serve = _serve_marker(sb.get("serve_side")) if "serve_side" in sb.keys() else "—"
-
-    content = (
+    
+    return (
         f"{title}\n"
         f"{a_names} **vs** {b_names}\n"
         f"{fmtline}\n"
@@ -183,6 +192,10 @@ async def post_scoreboard_message(inter: discord.Interaction, scoreboard_id: int
         f"{EMOJI_DONE} finalize · {EMOJI_NEXT} next-set · {EMOJI_SERVE} toggle serve"
     )
 
+async def post_scoreboard_message(inter: discord.Interaction, scoreboard_id: int, set_no: int) -> discord.Message:
+    """Post a scoreboard message and add reaction controls."""
+    content = await _format_scoreboard_content(scoreboard_id, set_no, inter.guild)
+    
     channel = inter.channel
     m = await channel.send(content, allowed_mentions=ALLOWED_MENTIONS)
     for e in (EMOJI_A_PLUS, EMOJI_B_PLUS, EMOJI_UNDO, EMOJI_SERVE, EMOJI_NEXT, EMOJI_DONE):
@@ -201,27 +214,7 @@ async def post_scoreboard_message(inter: discord.Interaction, scoreboard_id: int
 
 async def edit_scoreboard_message(message: discord.Message, scoreboard_id: int, set_no: int) -> None:
     """Edit an existing scoreboard message with updated scores (no pin)."""
-    sb = await db.get_scoreboard(scoreboard_id)
-    s = await db.get_set(scoreboard_id, set_no)
-    guild = message.guild
-
-    a_names = await _names(bot, guild, [int(x) for x in (sb["team_a"].split(",")) if x])
-    b_names = await _names(bot, guild, [int(x) for x in (sb["team_b"].split(",")) if x])
-
-    title = f"🏸 Live Scoreboard #{scoreboard_id} — Set {set_no}/{3}"
-    fmtline = f"Best-of-3 to {sb['target_points']} (win by 2, cap {sb['cap_points']})"
-    score = f"**A {s['a_points']} — {s['b_points']} B**"
-    serve = _serve_marker(sb.get("serve_side")) if "serve_side" in sb.keys() else "—"
-
-    content = (
-        f"{title}\n"
-        f"{a_names} **vs** {b_names}\n"
-        f"{fmtline}\n"
-        f"{score}   ·   Serve: {serve}\n\n"
-        f"React {EMOJI_A_PLUS} to add A point, {EMOJI_B_PLUS} for B, {EMOJI_UNDO} to undo.\n"
-        f"{EMOJI_DONE} finalize · {EMOJI_NEXT} next-set · {EMOJI_SERVE} toggle serve"
-    )
-
+    content = await _format_scoreboard_content(scoreboard_id, set_no, message.guild)
     await message.edit(content=content, allowed_mentions=ALLOWED_MENTIONS)
     # Never pin; optionally unpin if pinned
     try:
@@ -303,8 +296,8 @@ async def finalize_scoreboard_match(scoreboard_id: int) -> None:
     match_id = await db.insert_pending_match_points(
         guild_id=sb["guild_id"],
         mode=sb["mode"],
-        team_a=[int(x) for x in sb["team_a"].split(",") if x],
-        team_b=[int(x) for x in sb["team_b"].split(",") if x],
+        team_a=_parse_team_ids(sb["team_a"]),
+        team_b=_parse_team_ids(sb["team_b"]),
         set_scores=set_scores,
         reporter=sb["referee_id"],
         target_points=sb.get("target_points") or POINTS_TARGET_DEFAULT
@@ -580,8 +573,8 @@ async def stats(inter: discord.Interaction, user: discord.User):
         rows = []
         for m in matches:
             mode = str(m.get("mode", ""))
-            team_a_ids = [int(x) for x in (m.get("team_a") or "").split(",") if x]
-            team_b_ids = [int(x) for x in (m.get("team_b") or "").split(",") if x]
+            team_a_ids = _parse_team_ids(m.get("team_a") or "")
+            team_b_ids = _parse_team_ids(m.get("team_b") or "")
             winner = m.get("winner")
             try:
                 set_scores = json.loads(m.get("set_scores") or "[]")
@@ -822,8 +815,8 @@ async def pending(inter: discord.Interaction):
     for m, _ in unsigned:
         mid = m["id"]
         mode = m.get("mode", "")
-        a_ids = [int(x) for x in (m.get("team_a") or "").split(",") if x]
-        b_ids = [int(x) for x in (m.get("team_b") or "").split(",") if x]
+        a_ids = _parse_team_ids(m.get("team_a") or "")
+        b_ids = _parse_team_ids(m.get("team_b") or "")
         a_names = [await fmt.display_name_or_cached(bot, inter.guild, uid, fallback=f"User{uid}") for uid in a_ids]
         b_names = [await fmt.display_name_or_cached(bot, inter.guild, uid, fallback=f"User{uid}") for uid in b_ids]
         try:
@@ -943,8 +936,8 @@ async def notify_scoreboard_started(sb_id: int):
     if not sb:
         return
     guild = bot.get_guild(sb.get("guild_id")) if sb.get("guild_id") else None
-    a_ids = [int(x) for x in (sb.get("team_a") or "").split(",") if x]
-    b_ids = [int(x) for x in (sb.get("team_b") or "").split(",") if x]
+    a_ids = _parse_team_ids(sb.get("team_a") or "")
+    b_ids = _parse_team_ids(sb.get("team_b") or "")
     ref_id = sb.get("referee_id")
     title = fmt.bold(f"Live scoreboard started — #{sb_id}")
     body = ("A live scoreboard has started. After the match ends you'll receive a verification DM."
@@ -975,8 +968,8 @@ async def notify_verification(match_id: int, include_reporter: bool = False):
     participants = await db.get_match_participant_ids(match_id)
 
     # Build names
-    a_ids = [int(x) for x in (match.get("team_a") or "").split(",") if x]
-    b_ids = [int(x) for x in (match.get("team_b") or "").split(",") if x]
+    a_ids = _parse_team_ids(match.get("team_a") or "")
+    b_ids = _parse_team_ids(match.get("team_b") or "")
     a_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in a_ids]
     b_names = [await fmt.display_name_or_cached(bot, guild, uid, fallback=f"User{uid}") for uid in b_ids]
 
@@ -1081,8 +1074,8 @@ async def try_finalize_match(match_id: int):
     winner, _sa, _sb, pts_a, pts_b = match_winner(set_scores, target_points, POINTS_WIN_BY, cap)
     share_a = pts_a / max(1, (pts_a + pts_b))
 
-    a_ids = [int(x) for x in (match.get("team_a") or "").split(",") if x]
-    b_ids = [int(x) for x in (match.get("team_b") or "").split(",") if x]
+    a_ids = _parse_team_ids(match.get("team_a") or "")
+    b_ids = _parse_team_ids(match.get("team_b") or "")
 
     bot_id = _get_bot_id()
     

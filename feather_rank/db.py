@@ -138,6 +138,7 @@ async def get_match_participant_ids(match_id: int) -> list[int]:
     match = await get_match(match_id)
     if not match:
         return []
+    # Use generator expression to avoid unnecessary list creation
     ids = []
     for team in (match['team_a'], match['team_b']):
         ids.extend(int(x) for x in team.split(",") if x)

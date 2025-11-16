@@ -1,8 +1,13 @@
 import discord
 
-def point_options(target:int, cap:int|None) -> list[discord.SelectOption]:
+def _point_options(target: int, cap: int | None) -> list[discord.SelectOption]:
+    """Generate point options for a given target and cap."""
     hi = cap or (30 if target >= 21 else 15)
-    return [discord.SelectOption(label=str(i), value=str(i)) for i in range(0, hi+1)]
+    return [discord.SelectOption(label=str(i), value=str(i)) for i in range(0, hi + 1)]
+
+def point_options(target:int, cap:int|None) -> list[discord.SelectOption]:
+    """Generate point options for a given target and cap (legacy wrapper)."""
+    return _point_options(target, cap)
 
 class PointsSelect(discord.ui.Select):
     def __init__(self, set_idx:int, side:str, target:int, cap:int|None):

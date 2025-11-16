@@ -115,8 +115,8 @@ def elo_points_update(ra: float, rb: float, share_a: float, k: int = 32) -> tupl
 
 def team_points_update(ratingsA: list[float], ratingsB: list[float], share_a: float, k: int = 32) -> tuple[list[float], list[float]]:
     """Update team ratings based on points share for team A."""
-    Ra = sum(ratingsA) / len(ratingsA)
-    Rb = sum(ratingsB) / len(ratingsB)
+    Ra = team_rating(ratingsA)
+    Rb = team_rating(ratingsB)
     newA, newB = elo_points_update(Ra, Rb, share_a, k)
     dA = newA - Ra
     dB = newB - Rb
