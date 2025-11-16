@@ -1032,6 +1032,33 @@ async def notify_verification(match_id: int, include_reporter: bool = False):
         except Exception:
             log.debug("Failed to DM reporter=%s for pending match=%s", reporter, match_id)
 
+async def _get_players_for_teams(a_ids: list[int], b_ids: list[int]) -> tuple[list[dict], list[dict]]:
+    """Get or create player records for both teams, handling bot/guest players."""
+    bot_id = _get_bot_id()
+    
+    players_a = []
+    for uid in a_ids:
+        if uid == bot_id:
+            players_a.append(_create_guest_player(uid))
+        else:
+            players_a.append(await db.get_or_create_player(uid, f"User{uid}"))
+    
+    players_b = []
+    for uid in b_ids:
+        if uid == bot_id:
+            players_b.append(_create_guest_player(uid))
+        else:
+            players_b.append(await db.get_or_create_player(uid, f"User{uid}"))
+    
+    return players_a, players_b
+
+async def _update_player_ratings(players: list[dict], new_ratings: list[float], winner: str, team: str) -> None:
+    """Update ratings for non-bot players in a team."""
+    bot_id = _get_bot_id()
+    for i, p in enumerate(players):
+        if p["user_id"] != bot_id:
+            await db.update_player(p["user_id"], new_ratings[i], won=(winner == team))
+
 async def try_finalize_match(match_id: int):
     """
     Finalize when:
@@ -1076,23 +1103,9 @@ async def try_finalize_match(match_id: int):
 
     a_ids = _parse_team_ids(match.get("team_a") or "")
     b_ids = _parse_team_ids(match.get("team_b") or "")
-
-    bot_id = _get_bot_id()
     
     # Get or create players, using guest rating for bot
-    players_a = []
-    for uid in a_ids:
-        if uid == bot_id:
-            players_a.append(_create_guest_player(uid))
-        else:
-            players_a.append(await db.get_or_create_player(uid, f"User{uid}"))
-    
-    players_b = []
-    for uid in b_ids:
-        if uid == bot_id:
-            players_b.append(_create_guest_player(uid))
-        else:
-            players_b.append(await db.get_or_create_player(uid, f"User{uid}"))
+    players_a, players_b = await _get_players_for_teams(a_ids, b_ids)
     
     ratings_a = [p["rating"] for p in players_a]
     ratings_b = [p["rating"] for p in players_b]
@@ -1100,12 +1113,8 @@ async def try_finalize_match(match_id: int):
     new_ratings_a, new_ratings_b = team_points_update(ratings_a, ratings_b, share_a, k=K_FACTOR)
 
     # Update ratings only for non-bot players
-    for i, p in enumerate(players_a):
-        if p["user_id"] != bot_id:
-            await db.update_player(p["user_id"], new_ratings_a[i], won=(winner == "A"))
-    for i, p in enumerate(players_b):
-        if p["user_id"] != bot_id:
-            await db.update_player(p["user_id"], new_ratings_b[i], won=(winner == "B"))
+    await _update_player_ratings(players_a, new_ratings_a, winner, "A")
+    await _update_player_ratings(players_b, new_ratings_b, winner, "B")
 
     await db.finalize_points(match_id, winner, set_scores, pts_a, pts_b)
     await db.set_match_status(match_id, "verified")
