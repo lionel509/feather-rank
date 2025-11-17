@@ -1,41 +1,28 @@
-# syntax=docker/dockerfile:1
-FROM python:3.12-slim
+# Dockerfile.prod
+FROM python:3.11-slim
 
-# Keep Python lean and logs unbuffered
+# Python niceties
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=on \
-    PIP_NO_CACHE_DIR=on
+    PYTHONUNBUFFERED=1
 
+# App lives here
 WORKDIR /app
 
-# Install Python dependencies first for better layer caching
-COPY requirements.txt ./
-RUN python -m pip install --upgrade pip \
-    && pip install -r requirements.txt
+# System deps (add more if you need them)
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
-# Copy application source
-COPY . .
+# Install Python deps (if present)
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt || true
 
-# Fix Windows line endings and make scripts executable
-RUN apt-get update && apt-get install -y dos2unix && apt-get clean && rm -rf /var/lib/apt/lists/* \
-    && dos2unix run_prod.sh run_prod_ephemeral.sh 2>/dev/null || true \
-    && chmod +x run_prod.sh run_prod_ephemeral.sh || true
+# Copy the rest of the project
+COPY . /app
 
-# Runtime configuration
-ENV LOG_LEVEL=INFO \
-    TEST_MODE=0 \
-    EPHEMERAL_DB=0 \
-    DATABASE_PATH=/data/smashcord.sqlite
+# Ensure data dir exists inside container
+RUN mkdir -p /data
 
-# Create non-root user and data directory
-RUN useradd -m appuser \
-    && mkdir -p /data \
-    && chown -R appuser:appuser /data /app
-USER appuser
-
-# Persist DB outside the container FS
-VOLUME ["/data"]
-
-# Default entrypoint: production with persistent DB
-CMD ["./run_prod.sh"]
+# Default command: just run your app
+CMD ["python", "app.py"]

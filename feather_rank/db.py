@@ -682,13 +682,22 @@ async def insert_match(
     return new_id
 
 async def top_players(guild_id: int, limit: int = 10) -> list[dict]:
-    """Get top players by rating."""
+    """Get top players by rating, using signed_name from ToS when available."""
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         
         async with db.execute("""
-            SELECT * FROM players
-            ORDER BY rating DESC
+            SELECT 
+                p.user_id,
+                COALESCE(t.signed_name, p.username) as username,
+                p.rating,
+                p.wins,
+                p.losses,
+                p.created_at,
+                p.updated_at
+            FROM players p
+            LEFT JOIN tos_acceptances t ON p.user_id = t.user_id
+            ORDER BY p.rating DESC
             LIMIT ?
         """, (limit,)) as cursor:
             rows = await cursor.fetchall()

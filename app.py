@@ -533,8 +533,7 @@ async def leaderboard(inter: discord.Interaction, limit: app_commands.Range[int,
     lines = [f"**🏆 Leaderboard (Top {n})**"]
     for i, r in enumerate(rows, start=1):
         uid, name, rating, w, l = r["user_id"], r["username"], r["rating"], r["wins"], r["losses"]
-        mention = f"<@{uid}>"
-        lines.append(f"{i}. {mention} — {name} — {rating:.1f} ({w}-{l})")
+        lines.append(f"{i}. {name} — {rating:.1f} ({w}-{l})")
     await inter.response.send_message("\n".join(lines), allowed_mentions=ALLOWED_MENTIONS)
 
 # Stats
