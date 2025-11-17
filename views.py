@@ -1,8 +1,13 @@
 import discord
 
-def point_options(target:int, cap:int|None) -> list[discord.SelectOption]:
+def _point_options(target: int, cap: int | None) -> list[discord.SelectOption]:
+    """Generate point options for a given target and cap."""
     hi = cap or (30 if target >= 21 else 15)
-    return [discord.SelectOption(label=str(i), value=str(i)) for i in range(0, hi+1)]
+    return [discord.SelectOption(label=str(i), value=str(i)) for i in range(0, hi + 1)]
+
+def point_options(target:int, cap:int|None) -> list[discord.SelectOption]:
+    """Generate point options for a given target and cap (legacy wrapper)."""
+    return _point_options(target, cap)
 
 class PointsSelect(discord.ui.Select):
     def __init__(self, set_idx:int, side:str, target:int, cap:int|None):
@@ -182,17 +187,28 @@ class PointsScorePagerView(discord.ui.View):
                 await self.on_submit(interaction, sets)
             submit.callback = _submit
             self.add_item(submit)
-def gen_standard_scores(target: int):
-    # A wins normal: target–0 .. target–(target-11)
+def gen_standard_scores(target: int) -> list[tuple[str, int, int]]:
+    """Generate standard (non-deuce) score options for set selection.
+    
+    Returns list of (winner, score_a, score_b) tuples.
+    Example: target=21 generates 21-0, 21-1, ..., 21-10 for A and B wins.
+    """
     std = []
+    # A wins: target–0 through target–(target-11)
     for x in range(0, max(0, target - 10)):
-        std.append(("A", target, x))   # A target–x
+        std.append(("A", target, x))
+    # B wins: 0–target through (target-11)–target
     for x in range(0, max(0, target - 10)):
-        std.append(("B", x, target))   # B x–target
-    return std  # <= 22 entries at target=21, <= 20 at target=11
+        std.append(("B", x, target))
+    return std
 
 
-def gen_deuce_scores(target: int, win_by: int = 2, cap: int | None = None):
+def gen_deuce_scores(target: int, win_by: int = 2, cap: int | None = None) -> list[tuple[str, int, int]]:
+    """Generate deuce/high score options beyond standard scores.
+    
+    Returns list of (winner, score_a, score_b) tuples for close games.
+    Example: 22-20, 23-21, etc. up to cap.
+    """
     scores = []
     # e.g., 22–20, 23–21, ... up to cap or until it stops making sense
     top = cap if cap else target + 9  # default 30 for 21, 15 for 11 via caller

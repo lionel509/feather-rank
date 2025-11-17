@@ -30,6 +30,22 @@ def score_sets(sets: list[dict]) -> str:
 # --- Display name cache helper ---
 _NAME_CACHE: dict[tuple[Optional[int], int], tuple[float, str]] = {}
 _CACHE_TTL_SEC = 300.0  # 5 minutes
+_MAX_CACHE_SIZE = 1000  # Prevent unbounded growth
+
+
+def _clean_expired_cache():
+	"""Remove expired entries from the name cache to prevent memory bloat."""
+	now = time.time()
+	expired_keys = [k for k, v in _NAME_CACHE.items() if now - v[0] >= _CACHE_TTL_SEC]
+	for k in expired_keys:
+		del _NAME_CACHE[k]
+	
+	# If still too large, remove oldest entries
+	if len(_NAME_CACHE) > _MAX_CACHE_SIZE:
+		sorted_entries = sorted(_NAME_CACHE.items(), key=lambda x: x[1][0])
+		to_remove = len(_NAME_CACHE) - _MAX_CACHE_SIZE
+		for k, _ in sorted_entries[:to_remove]:
+			del _NAME_CACHE[k]
 
 
 async def display_name_or_cached(
@@ -57,6 +73,11 @@ async def display_name_or_cached(
 	g_id = getattr(guild, "id", None) if guild is not None else None
 	key = (g_id, user_id)
 	now = time.time()
+	
+	# Periodically clean expired entries (every ~100 lookups)
+	if len(_NAME_CACHE) % 100 == 0:
+		_clean_expired_cache()
+	
 	cached = _NAME_CACHE.get(key)
 	if cached and (now - cached[0] < _CACHE_TTL_SEC):
 		return cached[1]
